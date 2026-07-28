@@ -126,3 +126,4 @@ jobs:
             echo "- app_url: $(terraform output -raw app_url)" >> "$GITHUB_STEP_SUMMARY"
             echo "- resource_group: $(terraform output -raw resource_group)" >> "$GITHUB_STEP_SUMMARY"
           fi
+          
