@@ -1,0 +1,24 @@
+target   : https://tokenfoundry-apim-0a3378202d0b5.azure-api.net/llm-openai/v1/chat/completions
+model    : gpt-4o-mini   max_tokens=1200
+mode     : pipeline (continuous in-flight, NOT batch map)
+preset   : confirm   levels=24   duration=180s/step
+
+conc   ok  429  503  err     RPS       TPM   p50 s   p95 s
+----------------------------------------------------------
+  ... pipeline conc=24 for 180s
+  24  154   10 8328    0    0.86      7643    2.59    4.47
+     completed=8492 in 180s wall  tokens(ok)=22928
+     err sample: {"error":{"message":"too many requests\n"}}
+
+>>> error rate 98% > 50% — ceiling reached, stopping sweep
+
+============================================================
+PEAK sustained RPS : 0.86 req/s
+PEAK sustained TPM : 7643 tokens/min
+============================================================
+Note: 429 = upstream Copilot throttle (the real ceiling); 503 = APIM circuit breaker open (single-hub pool, clears in ~60s).
+
+No clean row (every step had 429 or 503).
+
+Cross-check: compare best clean TPM with load_test_ramp.py at the same concurrency.
+Large divergence (>15%) may indicate breaker cooldown, key limits, or sample duration.

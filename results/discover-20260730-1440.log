@@ -1,0 +1,42 @@
+Token Foundry — concurrency discovery
+generator: pipeline   levels=[8, 16, 24, 32, 40]   90s/level   cooldown=90s
+target   : https://tokenfoundry-apim-0a3378202d0b5.azure-api.net/llm-openai/v1/chat/completions
+model    : gpt-4o-mini   max_tokens=1200
+
+--- Level 1/5: pipeline conc=8 for 90s ---
+   8  317    0    0    0    3.52     31318    2.14    3.05
+     n=317  ok=317  tokens(ok)=46977  wall=90s
+
+... cooldown 90s ...
+
+--- Level 2/5: pipeline conc=16 for 90s ---
+  16  581    0    0    0    6.46     57823    2.24    3.76
+     n=581  ok=581  tokens(ok)=86734  wall=90s
+
+... cooldown 90s ...
+
+--- Level 3/5: pipeline conc=24 for 90s ---
+  24  255   10 3188    0    2.83     25467    2.18    3.66
+     n=3453  ok=255  tokens(ok)=38200  wall=90s
+     err sample: {"error":{"message":"too many requests\n"}}
+
+>>> error rate 93% — stopping discovery
+
+============================================================
+CONCURRENCY DISCOVERY (pipeline mode)
+============================================================
+conc   ok  429  503  err     RPS       TPM   p50 s   p95 s
+----------------------------------------------------------
+   8  317    0    0    0    3.52     31318    2.14    3.05  ✓
+  16  581    0    0    0    6.46     57823    2.24    3.76  ✓
+  24  255   10 3188    0    2.83     25467    2.18    3.66  ✗
+     10×429 upstream + 3188×503 breaker
+
+SWEET SPOT (max clean concurrency): 16
+  TPM=57823  RPS=6.46  0×429  0×503
+CEILING HIT: conc=24 (first level with 429/503 — stay at or below previous level in prod)
+
+Doc reference (1 account @ 24 conc): TPM=41,602
+Your sweet spot TPM vs doc: +39.0%  (doc assumes ~1 GitHub account ≈ conc 24)
+Estimated GitHub accounts (sweet conc / 24): ~1
+============================================================

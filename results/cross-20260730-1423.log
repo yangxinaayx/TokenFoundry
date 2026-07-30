@@ -1,0 +1,29 @@
+Token Foundry — cross-validation capacity test
+generator: pipeline (NOT load_test_ramp.py batch map)
+target   : https://tokenfoundry-apim-0a3378202d0b5.azure-api.net/llm-openai/v1/chat/completions
+model    : gpt-4o-mini   max_tokens=1200
+conc     : 24   phases=[60, 120]s   cooldown=90s
+
+--- Phase 1/2: pipeline conc=24 for 60s ---
+  24  127    2 2304    0    2.12     18890    2.63    4.23
+     n=2433  ok=127  tokens(ok)=18890  wall=60s
+     err sample: {"error":{"message":"too many requests\n"}}
+
+... cooldown 90s ...
+
+--- Phase 2/2: pipeline conc=24 for 120s ---
+  24  594    3 2710    0    4.95     44332    2.33    4.48
+     n=3307  ok=594  tokens(ok)=88663  wall=120s
+     err sample: {"error":{"message":"too many requests\n"}}
+
+============================================================
+CROSS-TEST COMPARISON (pipeline mode, independent of load_test_ramp.py)
+============================================================
+conc   ok  429  503  err     RPS       TPM   p50 s   p95 s
+----------------------------------------------------------
+P1/2  127    2 2304    0    2.12     18890    2.63    4.23  conc=24 dur=60s
+P2/2  594    3 2710    0    4.95     44332    2.33    4.48  conc=24 dur=120s
+
+VERDICT: FAIL — every phase had 429 or 503.
+  → Wait >=90s and retry, or lower --concurrency (try 16).
+  → Do NOT use long single phases (>120s) on a single-hub pool.

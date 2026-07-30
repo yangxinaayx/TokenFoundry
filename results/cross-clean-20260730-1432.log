@@ -1,0 +1,26 @@
+Token Foundry — cross-validation capacity test
+generator: pipeline (NOT load_test_ramp.py batch map)
+target   : https://tokenfoundry-apim-0a3378202d0b5.azure-api.net/llm-openai/v1/chat/completions
+model    : gpt-4o-mini   max_tokens=1200
+conc     : 16   phases=[120]s   cooldown=0s
+
+--- Phase 1/1: pipeline conc=16 for 120s ---
+  16  786    0    0    0    6.55     58600    2.17    4.09
+     n=786  ok=786  tokens(ok)=117199  wall=120s
+
+============================================================
+CROSS-TEST COMPARISON (pipeline mode, independent of load_test_ramp.py)
+============================================================
+conc   ok  429  503  err     RPS       TPM   p50 s   p95 s
+----------------------------------------------------------
+P1/1  786    0    0    0    6.55     58600    2.17    4.09  conc=16 dur=120s
+
+Best clean phase: TPM=58600  RPS=6.55  (conc=16, 0×429, 0×503)
+
+CAPACITY.zh.md reference (1 GitHub account, gpt-4o-mini @ 24 conc):
+  TPM=41,602   RPS=4.63
+  Your best vs doc: TPM +40.9%
+
+VERDICT: PARTIAL — only one clean phase; add a second --phases value for full cross-check.
+DOC ALIGNMENT: REVIEW — clean run but >15% from doc; check account count, region, hub health.
+============================================================
