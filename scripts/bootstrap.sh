@@ -85,7 +85,12 @@ log "STEP 1/2 — deploy.sh (provision environment + build images)"
 DEPLOY_ARGS=()
 [[ -n "$TAG" ]] && DEPLOY_ARGS+=("$TAG")
 [[ "$SKIP_BUILD" == true ]] && DEPLOY_ARGS+=("--skip-build")
-bash "$DEPLOY" "${DEPLOY_ARGS[@]}" || die "deploy.sh failed — SP creation skipped"
+# macOS /bin/bash 3.2 treats empty "${arr[@]}" as unbound under `set -u`.
+if ((${#DEPLOY_ARGS[@]} > 0)); then
+  bash "$DEPLOY" "${DEPLOY_ARGS[@]}" || die "deploy.sh failed — SP creation skipped"
+else
+  bash "$DEPLOY" || die "deploy.sh failed — SP creation skipped"
+fi
 ok "STEP 1/2 complete — environment is deployed"
 
 # --- 2. create the deployment SP (creds -> Key Vault) ---
