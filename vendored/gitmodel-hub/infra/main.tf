@@ -24,21 +24,31 @@ locals {
   # When image_ref_override is set (P2: pre-built shared image), use it verbatim
   # and skip the per-account az acr build entirely (see terraform_data.build).
   image_ref = var.image_ref_override != "" ? var.image_ref_override : "${var.image_name}:${substr(local.src_hash, 0, 12)}"
+
+  # Tags applied to every hub-owned resource so multiple accounts can share one RG.
+  hub_tags = {
+    SecurityControl          = "Ignore"
+    tokenfoundry-component   = "gitmodel-hub"
+    tokenfoundry-hub-account = var.account_id
+  }
+
+  rg_name     = var.create_resource_group ? azurerm_resource_group.rg[0].name : data.azurerm_resource_group.rg[0].name
+  rg_location = var.create_resource_group ? azurerm_resource_group.rg[0].location : data.azurerm_resource_group.rg[0].location
 }
 
 resource "azurerm_resource_group" "rg" {
+  count    = var.create_resource_group ? 1 : 0
   name     = var.resource_group_name
   location = var.location
 
-  # SecurityControl=Ignore MUST be present the instant the RG is created, so the
-  # org security policy doesn't block resources (e.g. the storage account) made
-  # inside it. In Terraform, tags are part of the RG's create API call — they're
-  # applied atomically with the RG, before anything that depends on it. Every
-  # resource below references azurerm_resource_group.rg, so they are all created
-  # strictly after this tag exists.
   tags = {
     SecurityControl = "Ignore"
   }
+}
+
+data "azurerm_resource_group" "rg" {
+  count = var.create_resource_group ? 0 : 1
+  name  = var.resource_group_name
 }
 
 # --- Container registry (create if missing, else use existing) ------------
@@ -59,8 +69,8 @@ resource "random_string" "acr_suffix" {
 resource "azurerm_container_registry" "acr" {
   count               = var.create_acr ? 1 : 0
   name                = "${var.prefix}${random_string.acr_suffix[0].result}"
-  resource_group_name = azurerm_resource_group.rg.name
-  location            = azurerm_resource_group.rg.location
+  resource_group_name = local.rg_name
+  location            = local.rg_location
   sku                 = "Basic" # supports ACR Tasks (cloud build) + MI pull
   admin_enabled       = false
 }
@@ -109,8 +119,9 @@ resource "terraform_data" "build" {
 
 resource "azurerm_user_assigned_identity" "app" {
   name                = "${var.prefix}-id"
-  resource_group_name = azurerm_resource_group.rg.name
-  location            = azurerm_resource_group.rg.location
+  resource_group_name = local.rg_name
+  location            = local.rg_location
+  tags                = local.hub_tags
 }
 
 resource "azurerm_role_assignment" "acr_pull" {
@@ -127,17 +138,19 @@ resource "azurerm_role_assignment" "acr_pull" {
 
 resource "azurerm_container_app_environment" "env" {
   name                = "${var.prefix}-env"
-  resource_group_name = azurerm_resource_group.rg.name
-  location            = azurerm_resource_group.rg.location
+  resource_group_name = local.rg_name
+  location            = local.rg_location
+  tags                = local.hub_tags
 }
 
 
 
 resource "azurerm_container_app" "hub" {
   name                         = "${var.prefix}-hub"
-  resource_group_name          = azurerm_resource_group.rg.name
+  resource_group_name          = local.rg_name
   container_app_environment_id = azurerm_container_app_environment.env.id
   revision_mode                = "Single"
+  tags                         = local.hub_tags
 
   identity {
     type         = "UserAssigned"

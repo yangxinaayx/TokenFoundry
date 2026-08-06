@@ -77,9 +77,11 @@ jobs:
         run: |
           set -euo pipefail
           ACCT="${{ inputs.account_id }}"
-          echo "rg=tokenfoundry-hub-${ACCT}" >> "$GITHUB_OUTPUT"
+          # Shared RG mode: deploy into the control-plane RG (HUB_ACR_RG / AI-api-gateway).
+          # Per-account isolation is by resource prefix + Azure tags, not a separate RG.
+          echo "rg=${HUB_ACR_RG}" >> "$GITHUB_OUTPUT"
           hex="${ACCT#*_}"
-          echo "prefix=h${hex:0:8}" >> "$GITHUB_OUTPUT"
+          echo "prefix=hub-${hex:0:8}" >> "$GITHUB_OUTPUT"
           echo "state_key=hubs/${ACCT}.tfstate" >> "$GITHUB_OUTPUT"
           # Per-account job input the control plane wrote (JSON): oauth/admin/hubkey.
           dash="${ACCT//_/-}"
@@ -111,6 +113,8 @@ jobs:
           TF_VAR_resource_group_name: ${{ steps.vars.outputs.rg }}
           TF_VAR_prefix: ${{ steps.vars.outputs.prefix }}
           TF_VAR_location: ${{ env.HUB_LOCATION }}
+          TF_VAR_create_resource_group: "false"
+          TF_VAR_account_id: ${{ inputs.account_id }}
           TF_VAR_create_acr: "false"
           TF_VAR_acr_name: ${{ env.HUB_ACR_NAME }}
           TF_VAR_acr_resource_group_name: ${{ env.HUB_ACR_RG }}

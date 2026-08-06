@@ -1,7 +1,19 @@
 variable "resource_group_name" {
   type        = string
-  description = "Resource group to create for the Container App resources."
+  description = "Target resource group for hub resources. When create_resource_group=false, must already exist (e.g. the shared control-plane RG)."
   default     = "gitmodel-rg"
+}
+
+variable "create_resource_group" {
+  type        = bool
+  description = "When false (default for TokenFoundry shared-RG mode), attach hub resources to an existing resource group instead of creating tokenfoundry-hub-*."
+  default     = false
+}
+
+variable "account_id" {
+  type        = string
+  description = "TokenFoundry GitHub account id (gha_xxx). Stamped on hub Azure resources as tag tokenfoundry-hub-account for Portal filtering."
+  default     = ""
 }
 
 variable "location" {

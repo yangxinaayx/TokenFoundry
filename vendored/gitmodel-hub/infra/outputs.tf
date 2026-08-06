@@ -4,7 +4,7 @@ output "app_url" {
 }
 
 output "resource_group" {
-  value = azurerm_resource_group.rg.name
+  value = local.rg_name
 }
 
 output "acr_login_server" {
