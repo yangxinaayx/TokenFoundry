@@ -1,6 +1,6 @@
 # API Management — the GenAI gateway (data plane).
 # Developer SKU for MVP; system-assigned identity used to reach AI backends and
-# to be granted Cosmos data-plane write on the usage container.
+# to publish custom token metrics to Application Insights.
 
 terraform {
   required_providers {
@@ -24,9 +24,6 @@ variable "app_insights_connection_string" {
   type      = string
   sensitive = true
 }
-# Cosmos DB — APIM writes usage records directly (outbound policy, MI auth).
-variable "cosmos_account_name" { type = string }
-variable "cosmos_account_id" { type = string }
 # APIM SKU. Default Developer_1 (classic, MVP/dev). Set to a v2 tier
 # (e.g. "StandardV2_1", "BasicV2_1") for native Anthropic Messages API token
 # metering — llm-emit-token-metric only understands the Anthropic response
@@ -36,9 +33,29 @@ variable "sku_name" {
   default = "Developer_1"
 }
 # Log Analytics workspace that receives the APIM gateway LLM logs (below). This is
-# the billing source of truth: token usage lands in the dedicated table
-# ApiManagementGatewayLlmLog. Wired from module.monitor.log_analytics_id.
+# Currently UNUSED — kept deliberately, do not "clean up".
+#
+# It fed the Azure Monitor diagnostic setting that shipped GatewayLogs to the
+# workspace. That setting was removed (see the long note further down: the table
+# duplicated AppRequests row for row and nothing read it). The variable stays so
+# the restore snippet in that note is a single paste, and because the root
+# module already wires it — removing it here means editing two files to bring
+# gateway logging back for a debugging session.
 variable "log_analytics_workspace_id" { type = string }
+
+# The UPSTREAM half of App Insights sampling: how much telemetry APIM SENDS.
+# The downstream half is the App Insights component's own ingestion sampling
+# (modules/monitor). They sit in series on one pipe — but turn this one, not
+# that one; see the root variable descriptions for why the downstream knob may
+# have no effect at all on APIM-sourced telemetry.
+#
+# Written in TWO places below and they must not diverge — see the note on
+# azapi_update_resource.diagnostic_metrics. That is exactly why this is a
+# variable rather than a literal: the two writes now cannot disagree.
+variable "sampling_percentage" {
+  type    = number
+  default = 100
+}
 
 resource "azurerm_api_management" "apim" {
   name                = substr("${var.name_prefix}-apim-${var.suffix}", 0, 50)
@@ -95,7 +112,7 @@ resource "azurerm_api_management_diagnostic" "appinsights" {
   resource_group_name      = var.resource_group_name
   api_management_logger_id = azurerm_api_management_logger.appinsights.id
 
-  sampling_percentage       = 100
+  sampling_percentage       = var.sampling_percentage
   always_log_errors         = true
   verbosity                 = "information"
   http_correlation_protocol = "W3C"
@@ -105,6 +122,19 @@ resource "azurerm_api_management_diagnostic" "appinsights" {
 # llm-emit-token-metric REQUIRES it (verified on dev-a02: requests logged but
 # customMetrics empty until metrics=true was PATCHed in). Patch it via azapi,
 # preserving the settings azurerm wrote above.
+#
+# This resource depends on the azurerm one (via resource_id), so terraform
+# always runs it SECOND — making it the last writer on the same ARM object.
+# Every field it repeats therefore WINS. That was a trap while the percentage
+# was a literal in both places: editing the azurerm one appeared to work,
+# terraform reported success, the plan showed the change, and azapi silently put
+# it back. Both now read `var.sampling_percentage`, so they cannot disagree.
+#
+# The repeated fields may not even be necessary — azapi_update_resource merges
+# its body into the existing resource, so `metrics` alone might suffice. That is
+# testable (drop them, apply, re-read sampling/alwaysLog from ARM) but untested,
+# and whoever wrote them may have been working around something the comment does
+# not record. Sharing the variable removes the hazard without betting on it.
 resource "azapi_update_resource" "diagnostic_metrics" {
   type        = "Microsoft.ApiManagement/service/diagnostics@2022-08-01"
   resource_id = azurerm_api_management_diagnostic.appinsights.id
@@ -117,56 +147,64 @@ resource "azapi_update_resource" "diagnostic_metrics" {
       httpCorrelationProtocol = "W3C"
       sampling = {
         samplingType = "fixed"
-        percentage   = 100
+        percentage   = var.sampling_percentage
       }
     }
   }
 }
 
-# APIM-level diagnostic SETTING (Azure Monitor) — routes the gateway LLM log
-# categories to the Log Analytics workspace. This is one HALF of the LLM token
-# billing pipeline:
-#   * this setting routes the GatewayLlmLogs category to the workspace's
-#     dedicated table (ApiManagementGatewayLlmLog), and
-#   * a per-API `largeLanguageModel` diagnostic (set in code by
-#     apim_provisioner._ensure_api_llm_diagnostic) is what actually turns token
-#     capture ON for each dynamically-created LLM API.
-# BOTH are required — verified on dev-a05 (2026-07-10): with only this setting and
-# no API-level diagnostic, streaming OpenAI token rows never reach the table.
+# NO Azure Monitor diagnostic setting on APIM — deliberately, and this is the
+# second category dropped from it rather than an oversight.
 #
-# logAnalyticsDestinationType = "Dedicated" gives the typed ApiManagementGatewayLlmLog
-# table (vs the generic AzureDiagnostics catch-all).
+# It used to route two categories to Log Analytics:
 #
-# NOTE: the GatewayLlmLogs category REQUIRES an APIM v2 tier (a05 = StandardV2). On
-# the default Developer_1 SKU this category does not exist and apply will fail —
-# billing/prod environments must set sku_name to a v2 tier.
-resource "azurerm_monitor_diagnostic_setting" "apim_llm_logs" {
-  name                           = "apim-gateway-llm-logs"
-  target_resource_id             = azurerm_api_management.apim.id
-  log_analytics_workspace_id     = var.log_analytics_workspace_id
-  log_analytics_destination_type = "Dedicated"
+# 1. GatewayLlmLogs -> ApiManagementGatewayLlmLog. Dropped first, because its
+#    token counts cannot be billed from. Measured on dev-15 (1180 requests):
+#    the prompt-token basis varies BY PROVIDER — claude-opus-4.8 reported 1,381
+#    against an actual 21,953 including cache reads (94% low), while
+#    gpt-5.4-mini reported 19,169, exactly prompt+cached. Same table, opposite
+#    conventions, and no column says which one a row uses. Streamed calls carry
+#    no content at all (0 of 114 rows) because SSE has no response body for the
+#    gateway to parse. The content it DID capture was a liability: full prompts
+#    and completions for every non-streamed call, unconditionally and for every
+#    tenant, which is not what docs/AUDIT.zh.md promises.
+#
+# 2. GatewayLogs -> ApiManagementGatewayLogs. Dropped now (2026-08-15). Nothing
+#    reads it: a whole-repo search finds the string only in this comment. And it
+#    is not merely unread, it is a DUPLICATE — measured on dev-19, that table
+#    and AppRequests held exactly the same 2,053 rows at ~2 MB each, the same
+#    calls written into the same workspace by two independent pipelines, one of
+#    which nobody queries. Ingestion scales with call volume (~1 MB per 1,000
+#    calls), so it is a bill that grows and never gets read.
+#
+# What still covers the ground it used to:
+#   * per-call latency + status  -> App Insights `requests` (AppRequests)
+#   * gateway vs backend split   -> `requests` joined to `dependencies`
+#   * token counts               -> llm-emit-token-metric (customMetrics) and
+#                                   the hub's copilot_usage via Event Hub -> Cosmos
+#   * audit trail                -> the hub's audit blob, not a gateway log
+#
+# What is genuinely given up: client IP, cache-hit status, and the raw
+# api/operation ids — useful for ad-hoc forensics, used by nothing today.
+#
+# Dropping the resource also removes a v2-tier constraint: GatewayLlmLogs does
+# not exist on Developer_1, so this used to fail apply on the default SKU.
+#
+# To bring it back for a debugging session, add:
+#   resource "azurerm_monitor_diagnostic_setting" "apim_gateway_logs" {
+#     name                           = "apim-gateway-logs"
+#     target_resource_id             = azurerm_api_management.apim.id
+#     log_analytics_workspace_id     = var.log_analytics_workspace_id
+#     log_analytics_destination_type = "Dedicated"
+#     enabled_log { category = "GatewayLogs" }
+#   }
 
-  enabled_log {
-    category = "GatewayLlmLogs"
-  }
-  enabled_log {
-    category = "GatewayLogs"
-  }
-}
-
-# Grant APIM's system identity Cosmos DB data-plane write access. The outbound
-# policy uses this identity to write a usage record per LLM call directly to the
-# `usage` container via the Cosmos REST API. The account sets
-# local_authentication_enabled=false, so this data-plane RBAC assignment is
-# required — control-plane roles do NOT grant it. Built-in "Cosmos DB Data
-# Contributor" (...0002) covers item create/upsert.
-resource "azurerm_cosmosdb_sql_role_assignment" "apim_cosmos_writer" {
-  resource_group_name = var.resource_group_name
-  account_name        = var.cosmos_account_name
-  role_definition_id  = "${var.cosmos_account_id}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002"
-  principal_id        = azurerm_api_management.apim.identity[0].principal_id
-  scope               = var.cosmos_account_id
-}
+# NOTE: APIM's identity deliberately has NO Cosmos role. It held "Cosmos DB Data
+# Contributor" for an outbound policy that wrote one usage document per call.
+# That policy is gone — usage now travels hub -> Event Hub -> Capture -> import
+# job -> Cosmos, and the gateway never touches the billing store. The grant was
+# standing write access to every tenant's billing data held by a component with
+# no reason to reach it, so it is removed rather than left as "harmless".
 
 # Let APIM's managed identity PUBLISH custom metrics to Application Insights.
 # llm-emit-token-metric writes per-call token counts (incl. the Prompt Cached

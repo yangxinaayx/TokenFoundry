@@ -9,6 +9,8 @@ a separate port. Health endpoint is unauthenticated for Container Apps probes.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,7 +34,67 @@ from app.api import (
 from app.config import get_settings
 
 settings = get_settings()
+
+# Configure the ROOT logger before anything else logs. Nothing in this app did
+# so previously, which meant Python's default WARNING level silently swallowed
+# every `logger.info` the service emits — the usage importer's per-run counters,
+# the re-login trail, the device-flow field names. Debugging then relies on
+# guessing from an empty log, and absence of a log line gets misread as absence
+# of the behaviour.
+#
+# `force=True` matters under uvicorn: it installs its own handlers on import, so
+# a plain basicConfig() would be a no-op and this would silently do nothing.
+#
+# Azure SDK loggers are pinned to WARNING regardless: at INFO they emit a block
+# per HTTP request (every Cosmos query, every Key Vault read), which would drown
+# the lines above in traffic nobody reads.
+logging.basicConfig(
+    level=settings.log_level.upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    force=True,
+)
+for _noisy in (
+    "azure",
+    "azure.core.pipeline.policies.http_logging_policy",
+    "urllib3",
+    # httpx logs a line per request at INFO. Observed on dev-15: provisioning one
+    # account emitted dozens of ARM URLs, burying the four lines that actually
+    # describe what happened. The URLs also carry subscription and resource ids
+    # into the log, which is needless exposure for a line nobody reads.
+    "httpx",
+    "httpcore",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+
+async def _usage_import_loop() -> None:
+    """Drain Event Hub Capture blobs into Cosmos, forever, on a timer.
+
+    The interval mirrors Capture's own flush interval: running faster only
+    re-lists the same blobs. The importer is synchronous (the Blob and Cosmos
+    SDKs are), so each pass goes to a worker thread — a slow import must not
+    stall the event loop serving the portal.
+
+    `run_once` swallows its own failures, so this loop only has to survive
+    cancellation. It is safe to have several replicas running it: imports are
+    idempotent upserts keyed on the request id.
+    """
+    from app.services.usage_capture_import import UsageCaptureImporter
+
+    importer = UsageCaptureImporter()
+    if not importer.configured:
+        logger.info("usage-import: no capture storage configured; importer disabled")
+        return
+
+    interval = max(settings.usage_capture_interval_seconds, 60)
+    # Stagger the first pass: on a rolling deploy every replica would otherwise
+    # start listing the same container in the same second.
+    await asyncio.sleep(interval)
+    while True:
+        await asyncio.to_thread(importer.run_once)
+        await asyncio.sleep(interval)
 
 
 @asynccontextmanager
@@ -44,7 +106,13 @@ async def lifespan(_app: FastAPI):
     from app.init_db import init_db
 
     init_db()
-    yield
+    importer = asyncio.create_task(_usage_import_loop())
+    try:
+        yield
+    finally:
+        importer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await importer
 
 
 app = FastAPI(

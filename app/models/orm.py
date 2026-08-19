@@ -13,6 +13,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Enum,
     Float,
@@ -64,6 +65,14 @@ class Tenant(Base, TimestampMixin):
     status: Mapped[TenantStatus] = mapped_column(
         Enum(TenantStatus), default=TenantStatus.ACTIVE
     )
+    # Raw request/response archival for this tenant's traffic. Default OFF and
+    # deliberately per tenant, not global: what gets archived is customer
+    # content (source code, and whatever was pasted into a prompt), so it is
+    # stored only where someone has consented. Flipping this pushes an `a` flag
+    # into the APIM named-value map, which makes the gateway stamp `x-tf-audit`;
+    # the hub archives nothing without that header. See
+    # apim_provisioner.set_audit_flag and vendored/gitmodel-hub/hub/audit.py.
+    audit_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     projects: Mapped[list[Project]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
@@ -214,7 +223,9 @@ class GitHubAccount(Base, TimestampMixin):
         Enum(DeployStatus), default=DeployStatus.PENDING
     )
     error_detail: Mapped[str | None] = mapped_column(String(2048))
-    # Device-flow handle kept only while status=pending (to poll GitHub).
+    # Device-flow handle, held only while a flow is in progress: the initial
+    # login (status=pending) or a re-login on a ready account (see
+    # /github-accounts/{id}/relogin/*). Cleared as soon as the flow resolves.
     device_code: Mapped[str | None] = mapped_column(String(128))
     # Deployed-infra coordinates (populated once terraform apply succeeds).
     resource_group: Mapped[str | None] = mapped_column(String(128))
@@ -224,6 +235,47 @@ class GitHubAccount(Base, TimestampMixin):
     # e.g. ["llm-openai-<id>", "llm-anthropic-<id>", "llm-google-<id>"]. Used to
     # remove them from the pools on delete.
     backend_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    # --- Hub-reported health (polled from the hub's /api/status) ---
+    #
+    # Deliberately NOT folded into `status`: that is a DEPLOY state machine, and
+    # a hub can be perfectly deployed while quietly failing to report usage.
+    # Conflating them would make a billing-feed outage look like a deploy
+    # problem, and would move a state machine that other code asserts is stable.
+    #
+    # `usage_events_lost` is the one to alert on: it counts EVENTS given up on
+    # for good, each once. `usage_events_dropped` counts failed hand-offs, so a
+    # single event retried twice contributes 3 — useful as a turbulence gauge,
+    # wrong as a loss figure. See vendored/gitmodel-hub/hub/eventhub.py.
+    usage_events_dropped: Mapped[int] = mapped_column(Integer, default=0)
+    usage_events_lost: Mapped[int] = mapped_column(Integer, default=0)
+    audit_payloads_dropped: Mapped[int] = mapped_column(Integer, default=0)
+    # Last successful poll. NULL means never reached — which reads very
+    # differently from "reached, and everything was zero".
+    hub_status_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Most recent drop reason, as the hub reported it: an exception CLASS NAME,
+    # never a message (the hub's /api/status is unauthenticated and Azure error
+    # strings carry namespace FQDNs and identity ids).
+    hub_drop_reason: Mapped[str | None] = mapped_column(String(256))
+
+
+class ImportWatermark(Base, TimestampMixin):
+    """How far a batch importer has read its source. One row per source.
+
+    Currently the only source is `usage_capture` — the Event Hub Capture blobs
+    the usage import job drains into Cosmos (app/services/usage_capture_import).
+
+    `position` is deliberately an opaque string rather than a typed cursor: what
+    "how far" means is the importer's business (an ISO timestamp here, a blob
+    name or offset for something else), and keeping it opaque means a new
+    importer needs no schema change. Re-reading from a stale position must be
+    harmless — every importer using this writes idempotently.
+    """
+
+    __tablename__ = "import_watermarks"
+
+    source: Mapped[str] = mapped_column(String(64), primary_key=True)
+    position: Mapped[str] = mapped_column(String(512), default="")
 
 
 # NOTE: UsageRecord is intentionally NOT an ORM model — it's a high-write,

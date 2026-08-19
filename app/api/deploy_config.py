@@ -83,8 +83,24 @@ def _compute_status(kv: KeyVaultService, detail: str | None = None) -> DeployCon
 def _repo_variables() -> dict[str, str]:
     """The HUB_* / TFSTATE_* Actions variables the workflow reads. Every value is
     injected by terraform (see terraform/modules/containerapps) — the app does no
-    string parsing or az query."""
+    string parsing or az query.
+
+    Raises HTTPException if the hub image tag is missing, rather than publishing
+    the ref `gitmodel:` and letting a hub deploy fail minutes later on a pull
+    error that names nothing useful. The tag is only ever empty when terraform
+    did not inject TF_HUB_IMAGE_TAG, which the operator can fix immediately —
+    but only if told here, at the moment they pressed the button.
+    """
     s = get_settings()
+    if not s.hub_image_tag:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "TF_HUB_IMAGE_TAG is not set on the control plane, so hub deploys "
+                "would pull `gitmodel:` and fail. Redeploy with deploy.sh, or set "
+                "the env var to a gitmodel tag that exists in ACR."
+            ),
+        )
     return {
         "HUB_ACR_NAME": s.acr_name,
         "HUB_ACR_RG": s.resource_group,
@@ -93,6 +109,17 @@ def _repo_variables() -> dict[str, str]:
         "TFSTATE_STORAGE_ACCOUNT": s.tfstate_storage_account,
         "TFSTATE_CONTAINER": s.tfstate_container,
         "HUB_KEYVAULT_NAME": s.keyvault_name,
+        # Usage reporting target. Empty is a valid state (no Event Hub deployed):
+        # the workflow passes it through and the hub simply reports nothing.
+        "HUB_EVENTHUB_NAMESPACE_ID": s.eventhub_namespace_id,
+        "HUB_EVENTHUB_FQDN": s.eventhub_fqdn,
+        "HUB_EVENTHUB_NAME": s.eventhub_name,
+        # Audit archive. Also legitimately empty (no audit account deployed):
+        # the hub treats an unset account URL as "archive nothing", which is the
+        # right failure direction for a feature that writes customer content.
+        "HUB_AUDIT_ACCOUNT_URL": s.audit_account_url,
+        "HUB_AUDIT_CONTAINER": s.audit_container,
+        "HUB_AUDIT_CONTAINER_SCOPE": s.audit_container_scope,
     }
 
 

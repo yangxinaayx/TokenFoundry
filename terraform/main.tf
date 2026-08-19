@@ -37,6 +37,7 @@ module "monitor" {
   tags        = local.tags
 
   resource_group_name = azurerm_resource_group.this.name
+  sampling_percentage = var.app_insights_sampling_percentage
 }
 
 # --- Secrets (Key Vault) ---
@@ -74,6 +75,36 @@ module "cosmos" {
 
   resource_group_name = azurerm_resource_group.this.name
   suffix              = local.suffix
+  throughput_rus      = var.cosmos_throughput_rus
+}
+
+# --- Usage transport (Event Hub + Capture to Blob) ---
+# Every GitModel hub emits one event per completed request; Capture drains them
+# to Avro blobs, and the control plane's import job turns those into Cosmos
+# documents. See modules/eventhub/main.tf for why it is a bus and not a direct
+# write.
+module "eventhub" {
+  source      = "./modules/eventhub"
+  name_prefix = var.name_prefix
+  location    = var.location
+  tags        = local.tags
+
+  resource_group_name = azurerm_resource_group.this.name
+  suffix              = local.suffix
+}
+
+# --- Audit archive (raw request/response bodies, opt-in per tenant) ---
+# Its own storage account rather than a container in the Capture one: this holds
+# customer content, not billing telemetry, and must carry its own retention and
+# its own (much shorter) access list. See modules/audit/main.tf.
+module "audit" {
+  source      = "./modules/audit"
+  name_prefix = var.name_prefix
+  location    = var.location
+  tags        = local.tags
+
+  resource_group_name = azurerm_resource_group.this.name
+  suffix              = local.suffix
 }
 
 # --- Container Registry (holds the single API+portal image) ---
@@ -100,10 +131,9 @@ module "apim" {
   publisher_name                 = var.publisher_name
   app_insights_id                = module.monitor.app_insights_id
   app_insights_connection_string = module.monitor.app_insights_connection_string
-  cosmos_account_name            = module.cosmos.account_name
-  cosmos_account_id              = module.cosmos.account_id
   sku_name                       = var.apim_sku
   log_analytics_workspace_id     = module.monitor.log_analytics_id
+  sampling_percentage            = var.apim_sampling_percentage
 }
 
 # --- App secrets in Key Vault (DB connection string, JWT secret, admin pwd) ---
@@ -148,6 +178,7 @@ module "containerapps" {
   log_analytics_workspace_id = module.monitor.log_analytics_id
   log_analytics_customer_id  = module.monitor.log_analytics_customer_id
   image_tag                  = var.image_tag
+  hub_image_tag              = var.hub_image_tag
   key_vault_uri              = module.keyvault.vault_uri
   keyvault_name              = module.keyvault.vault_name
   vault_id                   = module.keyvault.vault_id
@@ -171,4 +202,22 @@ module "containerapps" {
   tfstate_storage_account    = module.deployer.tfstate_storage_account_name
   tfstate_storage_account_id = module.deployer.tfstate_storage_account_id
   tfstate_container          = module.deployer.tfstate_container_name
+
+  # Usage pipeline: republish the Event Hub coordinates to the hub deploy, and
+  # read Capture's blobs for the import job.
+  eventhub_namespace_id            = module.eventhub.namespace_id
+  eventhub_fqdn                    = module.eventhub.fqdn
+  eventhub_name                    = module.eventhub.eventhub_name
+  usage_capture_storage_account    = module.eventhub.capture_storage_account_name
+  usage_capture_storage_account_id = module.eventhub.capture_storage_account_id
+  usage_capture_container          = module.eventhub.capture_container_name
+  usage_capture_interval_seconds   = tostring(module.eventhub.capture_interval_seconds)
+
+  # Audit archive: pure pass-through to the hub deploy. The control plane gets
+  # no role on this account — it republishes the coordinates and records blob
+  # paths, but reading a payload takes a separately-granted human role.
+  audit_account_url     = module.audit.account_url
+  audit_container       = module.audit.container_name
+  audit_container_scope = module.audit.container_scope
+  audit_retention_days  = tostring(module.audit.retention_days)
 }

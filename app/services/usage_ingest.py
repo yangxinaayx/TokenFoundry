@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from azure.cosmos import CosmosClient, PartitionKey
 from azure.identity import DefaultAzureCredential
@@ -141,6 +141,18 @@ class UsageStore:
         item["id"] = record.request_id
         self._container.upsert_item(item)
 
+    def upsert(self, doc: dict) -> None:
+        """Upsert a pre-shaped usage document (already carrying `id` and `pk`).
+
+        The batch importer builds its own document rather than going through
+        UsageRecord, because it carries fields UsageRecord has no room for (the
+        verbatim upstream `copilot_usage`, the end-user tag, streaming flag).
+        Upsert, not create: Event Hub Capture is at-least-once, so the same
+        request id can arrive twice and overwriting is what makes re-imports
+        free of duplicates.
+        """
+        self._container.upsert_item(doc)
+
     def query_tenant(self, tenant_id: str, limit: int = 1000) -> list[dict]:
         # Local/dev without a Cosmos account configured: return empty instead of
         # constructing a CosmosClient("") that would throw. Keeps /usage and
@@ -182,7 +194,11 @@ class UsageStore:
         )
 
     def query_by_subscriptions(
-        self, subscription_ids: list[str], limit: int = 1000, skip: int = 0
+        self,
+        subscription_ids: list[str],
+        limit: int = 1000,
+        skip: int = 0,
+        since_iso: str | None = None,
     ) -> list[dict]:
         """Usage records whose `subscription` (virtual key id) is in the given
         set. This is how a tenant's usage is resolved: the caller maps tenant ->
@@ -191,19 +207,21 @@ class UsageStore:
         plane yet), so the virtual key is the reliable tenant linkage.
 
         `skip`/`limit` give server-side pagination (OFFSET/LIMIT) for the portal
-        call log; pair with count_by_subscriptions for total pages."""
+        call log; pair with count_by_subscriptions for total pages.
+
+        `since_iso=None` means all time. It exists because the call log and the
+        breakdown below it used to disagree: this query had no time filter while
+        the breakdown hard-coded 24h, so a page could show a full call log above
+        "no usage in this window" — which reads as a broken dashboard, not as two
+        different questions."""
         if not self._endpoint or not subscription_ids:
             return []
-        # Cosmos supports ARRAY_CONTAINS(@ids, c.subscription) for an IN-style
-        # filter against a parameterized list.
+        where, params = self._agg_where(subscription_ids, since_iso)
         return list(
             self._container.query_items(
-                query=(
-                    "SELECT * FROM c WHERE ARRAY_CONTAINS(@ids, c.subscription) "
-                    "ORDER BY c.ts DESC OFFSET @skip LIMIT @n"
-                ),
+                query=f"SELECT * FROM c{where} ORDER BY c.ts DESC OFFSET @skip LIMIT @n",
                 parameters=[
-                    {"name": "@ids", "value": subscription_ids},
+                    *params,
                     {"name": "@skip", "value": skip},
                     {"name": "@n", "value": limit},
                 ],
@@ -211,23 +229,335 @@ class UsageStore:
             )
         )
 
-    def count_by_subscriptions(self, subscription_ids: list[str]) -> int:
+    def count_by_subscriptions(
+        self, subscription_ids: list[str], since_iso: str | None = None
+    ) -> int:
         """Total number of usage records for the given virtual keys — used to
-        compute page count for the paginated call log. Returns 0 when Cosmos is
-        not configured or the key set is empty."""
+        compute page count for the paginated call log. Must apply the SAME window
+        as query_by_subscriptions or the pager offers pages that come back empty.
+        Returns 0 when Cosmos is not configured or the key set is empty."""
         if not self._endpoint or not subscription_ids:
             return 0
+        where, _params = self._agg_where(subscription_ids, since_iso)
+        # A bare `SELECT VALUE COUNT(1)` is the only aggregate shape Cosmos
+        # accepts cross-partition (see the note above _MAX_ROWS).
         rows = list(
             self._container.query_items(
-                query=(
-                    "SELECT VALUE COUNT(1) FROM c "
-                    "WHERE ARRAY_CONTAINS(@ids, c.subscription)"
-                ),
-                parameters=[{"name": "@ids", "value": subscription_ids}],
+                query=f"SELECT VALUE COUNT(1) FROM c{where}",
+                parameters=_params,
                 enable_cross_partition_query=True,
             )
         )
         return int(rows[0]) if rows else 0
+
+    # ----------------------------------------------------------------- #
+    # Server-side aggregation (the billing-grade breakdown)              #
+    # ----------------------------------------------------------------- #
+    # Requested dimension -> the document field it groups on. A WHITELIST, not a
+    # convenience map: the value is interpolated into the query text (Cosmos has
+    # no bind parameter for an identifier), so anything reaching the SQL string
+    # must come from these literals and never from the caller.
+    _AGG_DIMS = {
+        "model": "route",
+        "api": "api",
+        "subscription": "subscription",
+        "backend": "hub_id",
+        # Cosmos-only: App Insights never saw the end user, because the metric
+        # policy can't read the request body.
+        "end_user": "end_user",
+    }
+
+    # Per-type token columns, in the order the portal renders them.
+    _TOKEN_FIELDS = ("prompt_tok", "cached_tok", "cache_write_tok", "completion_tok")
+
+    # Why these aggregate in Python rather than in Cosmos
+    # ---------------------------------------------------
+    # Cosmos NoSQL rejects every cross-partition aggregate except a bare
+    # `SELECT VALUE <AggregateFunc>`:
+    #
+    #   SELECT COUNT(1) AS calls, SUM(...) AS p FROM c
+    #     -> BadRequest: "Cross partition query only supports 'VALUE
+    #        <AggregateFunc>' for aggregates."
+    #   ...and adding GROUP BY fails the same way; `SELECT VALUE COUNT(1) ...
+    #        GROUP BY` is rejected as an unsupported feature.
+    #
+    # (Verified against the deployed account, not inferred from the docs.) The
+    # partition key is `<subscription>_<yyyyMM>`, so ANY breakdown spans
+    # partitions by construction — a tenant has several keys, and a window can
+    # cross a month. Server-side grouping is therefore not available to us at
+    # all, and the honest implementation is to project the few columns we need
+    # and fold them here.
+    #
+    # The cost of that is bounded by _MAX_ROWS below, and it is a real cost: the
+    # rows travel over the wire. It is nonetheless the correct trade, because
+    # the alternative shapes do not execute.
+    #
+    # Only the projected columns are fetched, never `SELECT *` — the documents
+    # also carry the verbatim upstream `copilot_usage` and the raw provider
+    # `usage` blob, which would dominate the payload and are not needed here.
+    _MAX_ROWS = 20000
+
+    # Cap on distinct groups RETURNED (not scanned). Group counts are naturally
+    # small for model/api/subscription; `end_user` is whatever the customer sent
+    # and has no natural bound.
+    _MAX_GROUPS = 500
+
+    def _agg_where(
+        self, subscription_ids: list[str] | None, since_iso: str | None
+    ) -> tuple[str, list[dict]]:
+        """WHERE clause + parameters shared by every aggregate below.
+
+        `subscription_ids=None` means platform-wide (admin); an EMPTY list is a
+        different thing entirely — a tenant with no keys — and the callers
+        short-circuit it before getting here rather than letting it degrade into
+        an unfiltered query over every tenant's data.
+        """
+        clauses: list[str] = []
+        params: list[dict] = []
+        if subscription_ids:
+            clauses.append("ARRAY_CONTAINS(@ids, c.subscription)")
+            params.append({"name": "@ids", "value": subscription_ids})
+        if since_iso:
+            # String comparison over ISO-8601. Sound only because _parse_ts
+            # normalizes every stored ts to UTC (see usage_capture_import).
+            clauses.append("c.ts >= @since")
+            params.append({"name": "@since", "value": since_iso})
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def _fetch_agg_rows(
+        self,
+        subscription_ids: list[str] | None,
+        since_iso: str | None,
+        extra_fields: tuple[str, ...] = (),
+    ) -> list[dict]:
+        """Project the columns an aggregate needs, newest first, capped.
+
+        Ordered by ts DESC so that if the cap does bite, what survives is the
+        most recent window rather than an arbitrary slice — a partial view of
+        "just now" is explicable to a user; a partial view of nothing in
+        particular is not.
+        """
+        cols = ", ".join(
+            f"c.{f}"
+            for f in (
+                *self._TOKEN_FIELDS,
+                "cost_usd",
+                "billed_usd",
+                # `status` is what separates a served call from one upstream
+                # refused. Every aggregate needs it, so it is projected here
+                # rather than passed in as an extra_field by each caller.
+                "status",
+                *extra_fields,
+            )
+        )
+        where, params = self._agg_where(subscription_ids, since_iso)
+        params = [*params, {"name": "@n", "value": self._MAX_ROWS}]
+        rows = list(
+            self._container.query_items(
+                query=f"SELECT {cols} FROM c{where} ORDER BY c.ts DESC OFFSET 0 LIMIT @n",
+                parameters=params,
+                enable_cross_partition_query=True,
+            )
+        )
+        if len(rows) >= self._MAX_ROWS:
+            # Never silently. At the cap the numbers below are a floor, not a
+            # total, and a dashboard that says so is worth more than one that
+            # quietly under-reports spend.
+            logger.warning(
+                "usage aggregation hit the %d-row cap; totals are partial for this window",
+                self._MAX_ROWS,
+            )
+        return rows
+
+    @staticmethod
+    def _blank(fields: tuple[str, ...]) -> dict:
+        return {
+            "calls": 0,
+            # Split out of `calls` because "1188 calls" hid 46 upstream
+            # rejections during the dev-16 campaign: they cost nothing, so the
+            # money was right, but the customer-facing call count was not. The
+            # split reads off the `status` the hub already records — it was in
+            # every document from the start and simply never projected.
+            "ok_calls": 0,
+            "failed_calls": 0,
+            # Per-status-code counts, e.g. {"429": 67}. A bare failure total
+            # cannot be reconciled against the gateway: an upstream throttle and
+            # a malformed request are both "failed" here, and only the former
+            # has a counterpart in the App Insights `requests` table. A fresh
+            # dict per bucket — sharing one would merge every group's errors.
+            "failed_by_status": {},
+            **dict.fromkeys(fields, 0),
+            "cost_usd": 0.0,
+            "billed_usd": 0.0,
+        }
+
+    @classmethod
+    def _accumulate(cls, bucket: dict, row: dict) -> None:
+        """Fold one document into a running bucket.
+
+        `or 0` on every read is load-bearing rather than defensive: a document
+        written before a column existed carries JSON null for it (verified —
+        legacy rows have `cache_write_tok: null`), and `null + int` raises.
+        """
+        bucket["calls"] += 1
+        # A document written before `status` existed has None here. Treating
+        # that as a failure would retroactively invent errors in historical
+        # data, so an unknown status counts as OK — the same way it read before
+        # this split existed.
+        status = row.get("status")
+        if isinstance(status, int) and status >= 400:
+            bucket["failed_calls"] += 1
+            # Keyed by string: this dict is JSON, and JSON object keys are
+            # strings anyway — doing it here keeps the portal from having to
+            # handle both forms.
+            by_status = bucket["failed_by_status"]
+            key = str(status)
+            by_status[key] = by_status.get(key, 0) + 1
+        else:
+            bucket["ok_calls"] += 1
+        for f in cls._TOKEN_FIELDS:
+            bucket[f] += int(row.get(f) or 0)
+        bucket["cost_usd"] += float(row.get("cost_usd") or 0.0)
+        bucket["billed_usd"] += float(row.get("billed_usd") or 0.0)
+
+    def cost_breakdown(
+        self,
+        subscription_ids: list[str] | None = None,
+        since_iso: str | None = None,
+        group_by: str = "model",
+    ) -> list[dict]:
+        """Per-group token + cost totals.
+
+        This is the billing-grade breakdown: `cost_usd`/`billed_usd` come from
+        upstream's own `total_nano_aiu` (recorded per call at import time), and
+        streaming calls are included on equal terms — the two things the App
+        Insights breakdown structurally cannot do.
+
+        Returns rows shaped {<group_by>, calls, prompt_tok, cached_tok,
+        cache_write_tok, completion_tok, cost_usd, billed_usd}, most expensive
+        first. [] when Cosmos isn't configured, the tenant has no keys, or
+        `group_by` isn't a known dimension.
+        """
+        if not self._endpoint or subscription_ids == []:
+            return []
+        field = self._AGG_DIMS.get(group_by)
+        if not field:
+            return []
+
+        rows = self._fetch_agg_rows(subscription_ids, since_iso, extra_fields=(field,))
+        buckets: dict[str, dict] = {}
+        for r in rows:
+            key = str(r.get(field) or "unknown")
+            bucket = buckets.get(key)
+            if bucket is None:
+                bucket = {group_by: key, **self._blank(self._TOKEN_FIELDS)}
+                buckets[key] = bucket
+            self._accumulate(bucket, r)
+
+        out = sorted(buckets.values(), key=lambda d: d["cost_usd"], reverse=True)
+        if len(out) > self._MAX_GROUPS:
+            # Say what was dropped. A silently truncated list reads as "this is
+            # everything", and the totals (computed over every row) would then
+            # not equal the sum of the rows shown.
+            logger.warning(
+                "cost_breakdown by=%s produced %d groups; showing the %d costliest",
+                group_by, len(out), self._MAX_GROUPS,
+            )
+            out = out[: self._MAX_GROUPS]
+        return out
+
+    def cost_totals(
+        self,
+        subscription_ids: list[str] | None = None,
+        since_iso: str | None = None,
+    ) -> dict:
+        """Window totals.
+
+        Computed over every row rather than by summing `cost_breakdown` so the
+        headline numbers stay whole even when the group list was truncated, and
+        so a NULL dimension (an unset end_user) can't drop calls from the total.
+        """
+        empty = self._blank(self._TOKEN_FIELDS)
+        if not self._endpoint or subscription_ids == []:
+            return empty
+
+        totals = self._blank(self._TOKEN_FIELDS)
+        for r in self._fetch_agg_rows(subscription_ids, since_iso):
+            self._accumulate(totals, r)
+        return totals
+
+    # Hourly buckets stop being readable long before the window stops being
+    # useful: 30 days is 720 points, which renders as noise and asks the x-axis
+    # for 720 slots. The threshold sits just past 48h so the common "yesterday
+    # and today" window keeps hour resolution.
+    _HOURLY_MAX_HOURS = 48
+
+    @classmethod
+    def trend_bucket(cls, hours: int) -> str:
+        """Granularity `cost_trend` will use for a window of `hours`: hour|day.
+
+        Exposed so the API can tell the portal which one it got — the chart
+        labels a daily point as a date and an hourly one as a time, and guessing
+        from the spacing would break on a window with a single bucket.
+        """
+        return "hour" if hours <= cls._HOURLY_MAX_HOURS else "day"
+
+    def cost_trend(
+        self,
+        subscription_ids: list[str] | None = None,
+        since_iso: str | None = None,
+        hours: int = 24,
+    ) -> list[dict]:
+        """Tokens/calls/cost series over the window, zero-filled, oldest first.
+
+        Buckets on a prefix of the stored timestamp — 13 chars for an hour
+        ("2026-08-04T10"), 10 for a day ("2026-08-04") — which IS the UTC bucket
+        because every ts is normalized to UTC at import. The zero-fill matters:
+        without it a quiet bucket vanishes and the chart draws a straight line
+        across the gap, implying traffic that never happened.
+        """
+        if not self._endpoint or subscription_ids == []:
+            return []
+
+        bucket = self.trend_bucket(hours)
+        hourly = bucket == "hour"
+        width, fmt = (13, "%Y-%m-%dT%H") if hourly else (10, "%Y-%m-%d")
+
+        rows = self._fetch_agg_rows(subscription_ids, since_iso, extra_fields=("ts",))
+        by_bucket: dict[str, dict] = {}
+        for r in rows:
+            ts = r.get("ts")
+            if not isinstance(ts, str):
+                continue
+            slot = by_bucket.setdefault(ts[:width], self._blank(self._TOKEN_FIELDS))
+            self._accumulate(slot, r)
+
+        now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        if not hourly:
+            now = now.replace(hour=0)
+        step = timedelta(hours=1) if hourly else timedelta(days=1)
+        # Round up: a 72h window is 3 days, a 70h window still spans 3 day
+        # buckets. Under-counting would clip the oldest bucket off the chart.
+        count = max(hours, 1) if hourly else max(-(-max(hours, 1) // 24), 1)
+
+        out: list[dict] = []
+        for i in range(count - 1, -1, -1):
+            slot_start = now - step * i
+            got = by_bucket.get(slot_start.strftime(fmt))
+            out.append(
+                {
+                    "ts": slot_start.isoformat(),
+                    # Every token type, cache_write included — omitting it would
+                    # make cache-heavy buckets read as a dip in the chart.
+                    "tokens": (
+                        sum(got[f] for f in self._TOKEN_FIELDS) if got else 0
+                    ),
+                    "calls": got["calls"] if got else 0,
+                    "cost_usd": got["cost_usd"] if got else 0.0,
+                }
+            )
+        return out
 
 
 class AppInsightsUsage:
@@ -249,13 +579,26 @@ class AppInsightsUsage:
           * base  — calls / p50 / p95 / failures, by API (the "which model most"
                     answer: rows are ordered by call count)
           * split — gateway vs backend duration, by API (requests↔dependencies)
-          * trend — calls per hour (time trend)
+          * codes — calls per HTTP status code, so a failure total can be
+                    reconciled against the Cosmos one instead of merely
+                    disagreeing with it
+          * trend — calls per bucket over the window (hourly, or daily once the
+                    window is long enough that hourly points stop being legible)
         Each query degrades independently: if the fragile dependency join yields
         nothing, the base latency table still renders and the split columns show
         as null. App Insights telemetry is best-effort, separate from Cosmos
         usage which is the billing source.
         """
-        empty: dict = {"by_api": [], "total_calls": 0, "by_hour": []}
+        empty: dict = {
+            "by_api": [],
+            "total_calls": 0,
+            "total_ok": 0,
+            "total_failures": 0,
+            "by_status": [],
+            "by_hour": [],
+            "bucket": UsageStore.trend_bucket(hours),
+            "hours": hours,
+        }
         if not self._client or not self._resource_id:
             return empty
 
@@ -297,15 +640,41 @@ class AppInsightsUsage:
             row["gateway_p50"] = split.get("gateway_p50") if split else None
             row["backend_p50"] = split.get("backend_p50") if split else None
 
-        # 3) Trend: calls per hour, oldest→newest. make-series zero-fills the
-        #    gaps so the chart shows a continuous 24h timeline (a plain summarize
-        #    by bin() only emits hours that had calls — producing a few isolated
+        # 3) Codes: one row per HTTP status the gateway returned. This is the
+        #    half of the reconciliation Cosmos cannot supply — a request the
+        #    circuit breaker sheds never reaches a hub, so it produces no usage
+        #    document at all. Without this table the two failure totals simply
+        #    disagree with no way to see why.
+        codes_kql = """
+        requests
+        | where name startswith 'POST /llm-'
+        | summarize calls = count() by resultCode
+        | order by calls desc
+        """
+        by_status = [
+            {"status": str(r.get("resultCode") or "?"),
+             "calls": int(r.get("calls", 0) or 0)}
+            for r in self._run_kql(codes_kql, hours)
+        ]
+
+        # 4) Trend: calls per bucket, oldest→newest. make-series zero-fills the
+        #    gaps so the chart shows a continuous timeline (a plain summarize
+        #    by bin() only emits buckets that had calls — producing a few isolated
         #    spikes with empty space between, not a real time series).
-        trend_kql = """
+        #
+        #    The range and step track `hours` rather than being fixed at 24h/1h:
+        #    they used to be hard-coded, so a 7-day window rendered a 7-day table
+        #    above a 24-hour chart with no indication the two disagreed. Step
+        #    switches to daily on the same threshold Cosmos uses, so both charts
+        #    on the page share a granularity.
+        #    `hours` is an int clamped by the caller, so interpolating it here is
+        #    not a KQL-injection surface; int() makes that guarantee local.
+        step = "1h" if hours <= UsageStore._HOURLY_MAX_HOURS else "1d"
+        trend_kql = f"""
         requests
         | where name startswith 'POST /llm-'
         | make-series calls = count() default = 0
-            on timestamp from ago(24h) to now() step 1h
+            on timestamp from ago({int(hours)}h) to now() step {step}
         | mv-expand timestamp to typeof(datetime), calls to typeof(long)
         | order by timestamp asc
         """
@@ -315,7 +684,22 @@ class AppInsightsUsage:
         ]
 
         total = sum(int(r.get("calls", 0) or 0) for r in by_api)
-        return {"by_api": by_api, "total_calls": total, "by_hour": by_hour}
+        # Derived from the per-API `failures` column rather than from
+        # `by_status`, so the headline still holds if the codes query is the one
+        # that degrades. A status that won't parse as an int (App Insights
+        # records client-side aborts as "0" and occasionally as text) counts as
+        # a failure — it is certainly not a served 200.
+        failures = sum(int(r.get("failures", 0) or 0) for r in by_api)
+        return {
+            "by_api": by_api,
+            "total_calls": total,
+            "total_ok": total - failures,
+            "total_failures": failures,
+            "by_status": by_status,
+            "by_hour": by_hour,
+            "bucket": UsageStore.trend_bucket(hours),
+            "hours": hours,
+        }
 
     def _run_kql(self, kql: str, hours: int) -> list[dict]:
         """Run one KQL query over the App Insights resource; [] on any failure.

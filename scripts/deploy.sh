@@ -65,7 +65,12 @@ trap '[[ "${TOKEN_REFRESH_PID:-}" ]] && kill "$TOKEN_REFRESH_PID" 2>/dev/null ||
 # long done and the tag is present in ACR. Key Vault access is granted inside
 # Terraform (keyvault module), so no manual role assignment here.
 log "terraform apply START — provisioning all infrastructure (APIM is the long pole)"
-terraform apply -input=false -auto-approve -var "image_tag=${TAG}" &
+# Both tags are passed explicitly and both are the SAME here, because step 5
+# below builds tokenfoundry:$TAG and gitmodel:$TAG together. They are separate
+# variables because update-app.sh later advances only the app one; see the
+# comment on image_tag in terraform/variables.tf.
+terraform apply -input=false -auto-approve \
+  -var "image_tag=${TAG}" -var "hub_image_tag=${TAG}" &
 APPLY_PID=$!
 
 # --- 4. Wait for ACR to come up (it only depends on the RG, so ~seconds) ---
@@ -110,7 +115,34 @@ wait "$APPLY_PID" || die "terraform apply failed — see output above"
 # Stop the token refresher now that the long apply is done.
 [[ "${TOKEN_REFRESH_PID:-}" ]] && kill "$TOKEN_REFRESH_PID" 2>/dev/null || true
 
-# --- 7. Smoke test ---
+# --- 7. Make sure the app is actually ON the image we just built ---
+# Terraform applies image_tag only when it CREATES the Container App: the image
+# field is under `ignore_changes` so that update-app.sh's out-of-band revisions
+# are not reverted on the next apply (see terraform/modules/containerapps).
+#
+# The consequence, which bit a real dev-16 re-run: if the app already existed —
+# a retry after a transient apply failure, or a second deploy.sh on a live
+# environment — terraform leaves the OLD image in place and this script would
+# otherwise report "deploy complete" while the code it just built was never
+# rolled out. So own the image here, the same way update-app.sh does, and keep
+# terraform out of it entirely.
+ACA_NAME="$(terraform output -raw app_name 2>/dev/null || true)"
+ACR_LOGIN="$(terraform output -raw acr_login_server 2>/dev/null || true)"
+APP_RG="$(terraform output -raw resource_group 2>/dev/null || true)"
+if [[ -n "$ACA_NAME" && -n "$ACR_LOGIN" && -n "$APP_RG" ]]; then
+  CURRENT_IMAGE="$(az containerapp show -g "$APP_RG" -n "$ACA_NAME" \
+    --query "properties.template.containers[0].image" -o tsv 2>/dev/null || true)"
+  WANT_IMAGE="${ACR_LOGIN}/tokenfoundry:${TAG}"
+  if [[ "$CURRENT_IMAGE" != "$WANT_IMAGE" ]]; then
+    log "Rolling Container App onto ${WANT_IMAGE} (was: ${CURRENT_IMAGE:-none})"
+    az containerapp update -g "$APP_RG" -n "$ACA_NAME" --image "$WANT_IMAGE" -o none \
+      || die "az containerapp update failed — see output above"
+  else
+    log "Container App already on tokenfoundry:${TAG}"
+  fi
+fi
+
+# --- 8. Smoke test ---
 APP_FQDN="$(terraform output -raw app_fqdn)"
 log "Smoke test: https://${APP_FQDN}/healthz"
 if curl -fsS -m 30 "https://${APP_FQDN}/healthz"; then

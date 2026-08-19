@@ -137,6 +137,20 @@ _KEY_LIMITS_MAX_BYTES = 4000
 _TPM_UNLIMITED = 1_000_000_000
 _PERIOD_DEFAULT = "Yearly"
 
+# Policy expression for the raw-body audit opt-in, read out of the same
+# per-subscription map as the token limits (field "a"). Emitted as the value of
+# `x-tf-audit` with exists-action="override", which is what stops a client from
+# switching its own auditing on or off. Defaults to "0" on any parse failure:
+# a broken map must fail CLOSED, since the alternative is archiving customer
+# source code for a tenant that never consented.
+_AUDIT_FLAG_EXPR = (
+    "@{ try {"
+    " var m=Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables[\"tfRaw\"]);"
+    " var e=m[context.Subscription.Id] as Newtonsoft.Json.Linq.JObject;"
+    " return (e!=null&amp;&amp;e[\"a\"]!=null&amp;&amp;(int)e[\"a\"]==1)?\"1\":\"0\";"
+    " } catch { return \"0\"; } }"
+)
+
 
 def _merge_key_limit(
     mapping: dict,
@@ -151,7 +165,13 @@ def _merge_key_limit(
     {"t": tpm, "qt": quota_tier, "p": period}; absent fields are omitted. A
     quota_tier of "none" (or None) is treated as absent. Pure — no Azure calls —
     so it's unit-testable. Raises ValueError if the resulting map would exceed the
-    named value size cap (surfaces at issuance, never silent)."""
+    named value size cap (surfaces at issuance, never silent).
+
+    The audit flag ("a") is written by `_merge_audit_flag` and is CARRIED OVER
+    untouched here: limits and auditing are set by different operations, so a
+    limits update must not silently switch a tenant's archival off (or a stale
+    caller switch it back on).
+    """
     out = dict(mapping)
     entry: dict[str, object] = {}
     if tpm is not None:
@@ -160,6 +180,9 @@ def _merge_key_limit(
         entry["qt"] = quota_tier
     if period is not None:
         entry["p"] = period
+    prior = mapping.get(sub_id)
+    if isinstance(prior, dict) and prior.get("a"):
+        entry["a"] = prior["a"]
     if entry:
         out[sub_id] = entry
     else:
@@ -170,6 +193,39 @@ def _merge_key_limit(
             f"per-key limits map would exceed {_KEY_LIMITS_MAX_BYTES} bytes "
             f"({len(serialized)}); too many keys have custom limits for the "
             f"single-named-value scheme — see docs/APIM-LLM-Gateway.md §4.5"
+        )
+    return out
+
+
+def _merge_audit_flag(mapping: dict, sub_ids: list[str], enabled: bool) -> dict:
+    """Return a NEW map with the audit flag set/cleared for several keys at once.
+
+    Bulk because the toggle is per TENANT while the map is keyed per APIM
+    subscription — flipping one tenant touches all of its keys, and doing that
+    as N read-merge-writes would lose races against itself.
+
+    Only the "a" field is touched; limits are carried over. An entry that ends
+    up empty is dropped so switching auditing off does not leave a growing tail
+    of `{}` entries in a size-capped named value.
+    """
+    out = dict(mapping)
+    for sub_id in sub_ids:
+        entry = dict(out.get(sub_id) or {})
+        if enabled:
+            entry["a"] = 1
+        else:
+            entry.pop("a", None)
+        if entry:
+            out[sub_id] = entry
+        else:
+            out.pop(sub_id, None)
+    serialized = json.dumps(out, separators=(",", ":"))
+    if len(serialized) > _KEY_LIMITS_MAX_BYTES:
+        raise ValueError(
+            f"per-key limits map would exceed {_KEY_LIMITS_MAX_BYTES} bytes "
+            f"({len(serialized)}); too many keys carry custom limits or audit "
+            f"flags for the single-named-value scheme — see "
+            f"docs/APIM-LLM-Gateway.md §4.5"
         )
     return out
 
@@ -240,6 +296,27 @@ class ApimProvisioner:
         "catch { return &quot;unknown&quot;; } "
         "}"
     )
+    # NOTE: no metadata here may read `context.Response.Body`.
+    #
+    # This trace used to carry a `usage` field built from
+    # `context.Response.Body.As<JObject>(preserveContent:true)`. Parsing the body
+    # as JSON requires having ALL of it, so APIM held the entire response —
+    # headers included — until upstream finished. Streaming still worked hop by
+    # hop from the hub, and was then flattened at the gateway: measured on
+    # dev-18, first byte at the client went from 0.94s (direct to the hub) to
+    # 44.08s (through APIM), with 100% of the body arriving in one burst.
+    # Removing this one metadata line brought it back to 3.08s with the bytes
+    # spread over 71% of the elapsed time.
+    #
+    # It bought nothing in exchange. An SSE response is not a JSON object, so
+    # `As<JObject>()` always threw on exactly the calls it damaged and the
+    # attribute recorded the fallback string. The reasoning was already written
+    # down one docstring below — the outbound `send-one-way-request` was deleted
+    # for this same reason — it just was not applied here as well.
+    #
+    # Token counts come from `llm-emit-token-metric` (real time) and from the
+    # hub's own event via Cosmos (billing). Neither needs the body at the
+    # gateway.
     _USAGE_TRACE = (
         '<trace source="tokenfoundry-usage" severity="information">'
         '<message>@("llm-usage " + context.Api.Id + " " + context.RequestId)</message>'
@@ -248,11 +325,6 @@ class ApimProvisioner:
         '<metadata name="subscription" value="@(context.Subscription?.Id ?? &quot;none&quot;)" />'
         '<metadata name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tfModel&quot;, &quot;unknown&quot;))" />'
         f'<metadata name="hub" value="{_HUB_EXPR}" />'
-        '<metadata name="usage" value="@{ try { var b = '
-        "context.Response.Body.As&lt;Newtonsoft.Json.Linq.JObject&gt;(preserveContent:true); "
-        "var u = b[&quot;usage&quot;] as Newtonsoft.Json.Linq.JObject; "
-        "return u != null ? u.ToString(Newtonsoft.Json.Formatting.None) : &quot;NO_USAGE_KEY&quot;; } "
-        'catch { return &quot;BODY_READ_FAILED&quot;; } }" />'
         "</trace>"
     )
 
@@ -261,9 +333,9 @@ class ApimProvisioner:
         self._sub_id = s.azure_subscription_id
         self._rg = s.resource_group
         self._service = s.apim_service_name
-        self._cosmos_endpoint = s.cosmos_endpoint.rstrip("/")
-        self._cosmos_db = s.cosmos_database
-        self._cosmos_container = s.cosmos_usage_container
+        # No Cosmos coordinates here any more: APIM no longer writes usage
+        # documents (see `_build_provider_policy`). Cosmos is reached only by the
+        # control plane's own ingest/import services.
         self._client: ApiManagementClient | None = None
 
     @property
@@ -417,12 +489,12 @@ class ApimProvisioner:
             except (ResourceNotFoundError, HttpResponseError) as exc:
                 logger.warning("link %s to product %s skipped: %s", cfg["api_id"], product_id, exc)
 
-        # Turn on API-level LLM logging so token + prompts/completions for THIS
-        # dynamically-created API land in ApiManagementGatewayLlmLog (the billing
-        # source of truth). This is the real switch — the APIM-level diagnostic
-        # setting (terraform) only routes the category to the workspace; without
-        # this per-API diagnostic no token rows are recorded (verified a05
-        # 2026-07-10). Best-effort: a diagnostic failure must not abort a deploy.
+        # Pin this API's diagnostic so custom metrics keep flowing. An API-level
+        # diagnostic overrides the service-level one, so an API created without
+        # it silently loses metrics=true and its customMetrics go empty
+        # (verified a05 2026-07-10). It no longer enables LLM message logging —
+        # see _ensure_api_llm_diagnostic for why that was removed. Best-effort:
+        # a diagnostic failure must not abort a deploy.
         self._ensure_api_llm_diagnostic(cfg["api_id"])
 
     @staticmethod
@@ -574,65 +646,85 @@ class ApimProvisioner:
     </choose>"""
 
     def _build_provider_policy(self, backend_id: str, provider: str) -> str:
-        """Inbound governance + outbound Cosmos usage write for a provider API.
+        """Inbound governance + caller-identity injection for a provider API.
 
         Each provider API binds one backend; the upstream (multi-model) backend
-        dispatches by the body's `model`. Outbound writes one usage record per
-        successful, NON-STREAMING call to the `usage` container
-        (send-one-way-request, fire-and-forget, MI auth) — the Cosmos endpoint
-        comes from settings so it always matches the deployed account (never a
-        hardcoded host).
+        dispatches by the body's `model`.
 
-        Streaming (SSE) responses are deliberately NOT persisted to Cosmos: the
-        outbound `As<JObject>()` body read would force APIM to buffer the whole
-        response, defeating token-by-token passthrough, and an event-stream body
-        isn't a single JSON object anyway. Streaming token accounting therefore
-        rides on the native `llm-emit-token-metric` (App Insights), which counts
-        inside the pipeline without reading the body. The outbound write is gated
-        on the response Content-Type not being `text/event-stream` (provider-
-        agnostic — all four providers stream with that media type).
+        **Identity injection.** Every APIM tenant reaches the hub with the SAME
+        credential — `add_hub_to_pools()` configures all provider backends with
+        one `hub_key` — so the hub cannot tell tenants apart from the request
+        alone. These three headers are the chargeback key:
+
+          * `x-tf-subscription` — the billed party (APIM subscription id)
+          * `x-tf-api`          — which provider API was used
+          * `x-tf-request-id`   — APIM's request id, reused downstream as the
+                                  Cosmos document id, which makes the import
+                                  idempotent under at-least-once delivery
+
+        `exists-action="override"` is load-bearing: without it a client could
+        send its own `x-tf-subscription` and be billed as somebody else.
+
+        **Audit opt-in.** A fourth header, `x-tf-audit`, tells the hub whether
+        this tenant consented to having its raw request/response bodies
+        archived. It is read from the same per-subscription named value the
+        token limits come from, so it must sit AFTER `{limit_block}` (that is
+        where `tfRaw` is populated). Same override rule, for a sharper reason:
+        the header is the only consent record the hub sees, so a forgeable one
+        would let a caller either archive its own traffic or hide it.
+
+        **No Cosmos write here.** The outbound `send-one-way-request` that used
+        to persist a usage document was removed. It could only ever read
+        NON-streaming bodies (`As<JObject>()` on an SSE response is meaningless,
+        and buffering it would defeat token-by-token passthrough), so it silently
+        billed nothing for every streaming call — unusable as a billing source.
+        Usage now originates at the hub, which sees both shapes and forwards
+        upstream's authoritative `copilot_usage`, and travels
+        hub → Event Hub → Capture → import job → Cosmos.
+
+        The same reasoning later had to be applied a second time: `_USAGE_TRACE`
+        carried its own `As<JObject>()` on the response body and flattened
+        streaming exactly the same way (first byte 0.94s direct to the hub vs
+        44.08s through APIM). Nothing in `<outbound>` may touch
+        `context.Response.Body` — see the note on `_USAGE_TRACE`.
+
+        `llm-emit-token-metric` and `_USAGE_TRACE` stay: that is the real-time
+        App Insights observability line, deliberately decoupled from billing.
 
         `provider` is accepted for symmetry with the per-operation streaming
         policy (see `_build_chat_stream_policy`); the API-level policy itself is
         provider-agnostic.
         """
         _ = provider  # API-level policy is provider-agnostic; kept for symmetry
-        docs = f"{self._cosmos_endpoint}/dbs/{self._cosmos_db}/colls/{self._cosmos_container}/docs"
         limit_block = self._build_limit_block()
         return f"""<policies>
   <inbound>
     <base />
     <set-backend-service backend-id="{backend_id}" />
+    <set-header name="x-tf-subscription" exists-action="override">
+      <value>@(context.Subscription?.Id ?? "none")</value>
+    </set-header>
+    <set-header name="x-tf-api" exists-action="override">
+      <value>@(context.Api.Id)</value>
+    </set-header>
+    <set-header name="x-tf-request-id" exists-action="override">
+      <value>@(context.RequestId.ToString())</value>
+    </set-header>
     {limit_block}
+    <set-header name="x-tf-audit" exists-action="override">
+      <value>{_AUDIT_FLAG_EXPR}</value>
+    </set-header>
     {self._MODEL_VAR}
     <llm-emit-token-metric namespace="tokenfoundry">
       <dimension name="subscription" value="@(context.Subscription.Id)" />
       <dimension name="api" value="@(context.Api.Id)" />
       <dimension name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tfModel&quot;, &quot;unknown&quot;))" />
     </llm-emit-token-metric>
-    <authentication-managed-identity resource="https://cosmos.azure.com"
-      output-token-variable-name="cosmosToken" ignore-error="true" />
   </inbound>
   <backend><base /></backend>
   <outbound>
     <base />
     {self._USAGE_TRACE}
-    <choose>
-      <when condition="@(context.Response.StatusCode == 200 &amp;&amp; context.Variables.ContainsKey(&quot;cosmosToken&quot;) &amp;&amp; !context.Response.Headers.GetValueOrDefault(&quot;Content-Type&quot;,&quot;&quot;).Contains(&quot;text/event-stream&quot;))">
-        <send-one-way-request mode="new">
-          <set-url>{docs}</set-url>
-          <set-method>POST</set-method>
-          <set-header name="Authorization" exists-action="override">
-            <value>@(System.Net.WebUtility.UrlEncode("type=aad&amp;ver=1.0&amp;sig=" + (string)context.Variables["cosmosToken"]))</value>
-          </set-header>
-          <set-header name="x-ms-version" exists-action="override"><value>2018-12-31</value></set-header>
-          <set-header name="x-ms-documentdb-partitionkey" exists-action="override">
-            <value>@("[\\"" + context.Subscription.Id + "_" + DateTime.UtcNow.ToString("yyyyMM") + "\\"]")</value>
-          </set-header>
-          <set-body>@{{var doc=new JObject();doc["id"]=context.RequestId;doc["pk"]=context.Subscription.Id+"_"+DateTime.UtcNow.ToString("yyyyMM");doc["ts"]=DateTime.UtcNow.ToString("o");doc["subscription"]=context.Subscription.Id;doc["api"]=context.Api.Id;try{{doc["raw_response"]=context.Response.Body.As&lt;JObject&gt;(preserveContent:true);}}catch{{doc["raw_response"]=null;}}return doc.ToString();}}</set-body>
-        </send-one-way-request>
-      </when>
-    </choose>
   </outbound>
   <on-error><base /></on-error>
 </policies>"""
@@ -803,6 +895,34 @@ class ApimProvisioner:
                     continue
                 raise
 
+    def set_audit_flag(self, subscription_ids: list[str], enabled: bool) -> None:
+        """Turn raw-body archival on/off for a set of keys, in one write.
+
+        The gateway reads this out of the same named value as the token limits
+        and stamps `x-tf-audit` on every request, which is the hub's only
+        authority for archiving a body. Takes a LIST because the product-level
+        toggle is per tenant while the map is keyed per subscription.
+
+        Raises on over-cap or persistent write failure — a caller that just
+        promised a customer "auditing is on" must not report success when the
+        gateway was never told.
+        """
+        if not subscription_ids:
+            return
+        for attempt in range(3):
+            current, etag = self._read_key_limits()
+            merged = _merge_audit_flag(current, subscription_ids, enabled)
+            if merged == current:
+                return
+            try:
+                self._write_key_limits(merged, etag)
+                return
+            except HttpResponseError as exc:
+                if getattr(exc, "status_code", None) == 412 and attempt < 2:
+                    logger.info("named value %s changed; retrying", KEY_LIMITS_NV)
+                    continue
+                raise
+
     def remove_key_limits(self, subscription_id: str) -> None:
         """Remove a key's entry from the shared limits map (best-effort, on key
         delete). Same retry-on-precondition as upsert; a missing entry is a no-op."""
@@ -890,16 +1010,32 @@ class ApimProvisioner:
         return DefaultAzureCredential().get_token("https://management.azure.com/.default").token
 
     def _ensure_api_llm_diagnostic(self, api_id: str) -> None:
-        """Enable API-level `largeLanguageModel` logging on this API's
-        applicationinsights diagnostic, so token counts + prompts/completions
-        for LLM calls land in the dedicated ApiManagementGatewayLlmLog table.
+        """Pin this API's applicationinsights diagnostic so custom metrics survive.
 
-        Uses raw ARM REST (the SDK DiagnosticContract lacks the preview
-        largeLanguageModel field). Idempotent plain PUT. loggerId hardcodes the
-        'appinsights' logger (matches the terraform/bicep logger name). The
-        diagnostic id 'applicationinsights' matches the existing service-level
-        diagnostic name — API scope and service scope are distinct, so same name
-        does not conflict. Best-effort: a failure here must not abort a deploy."""
+        This exists ONLY to keep `metrics: true` in force at API scope. It used
+        to also switch on `largeLanguageModel` message capture, which fed the
+        ApiManagementGatewayLlmLog table; that is gone — the table's token
+        counts turned out to use a different prompt basis per provider (claude
+        excluded cache reads, gpt-5.4-mini included them, with no column saying
+        which), so nothing could be billed from it, and the full prompts and
+        completions it stored for non-streamed calls were captured for every
+        tenant regardless of the per-tenant audit switch. The collector is off
+        in terraform too, so this would now write content nobody reads.
+
+        The remaining `metrics: true` is load-bearing and easy to delete by
+        mistake: an API-level diagnostic OVERRIDES the service-level one for
+        this API. The service diagnostic sets metrics=true, which is what lets
+        llm-emit-token-metric write token counts (incl. Prompt Cached Tokens) to
+        App Insights customMetrics. An API-level diagnostic that omits metrics
+        overrides that to off and SILENTLY KILLS customMetrics for this API.
+        Root-caused on dev-a05 (2026-07-10). If this method is ever deleted
+        outright, delete the API-level diagnostic with it — do not leave one
+        behind without metrics.
+
+        Uses raw ARM REST (the SDK DiagnosticContract lacks these preview
+        fields). Idempotent plain PUT. Best-effort: a failure must not abort a
+        deploy.
+        """
         base = (
             f"https://management.azure.com/subscriptions/{self._sub_id}"
             f"/resourceGroups/{self._rg}/providers/Microsoft.ApiManagement"
@@ -913,24 +1049,7 @@ class ApimProvisioner:
         body = {
             "properties": {
                 "loggerId": logger_id,
-                # metrics=True is CRITICAL and easy to miss: an API-level diagnostic
-                # OVERRIDES the service-level one for this API. The service diagnostic
-                # sets metrics=true (so llm-emit-token-metric writes token counts —
-                # incl. the Prompt Cached Tokens dimension — to App Insights
-                # customMetrics). If this API-level diagnostic omits metrics, it
-                # overrides that to metrics=off and SILENTLY KILLS customMetrics for
-                # this API — while LlmLog keeps working, so it looks fine until you
-                # notice the customMetrics token breakdown (and cached) went empty.
-                # Root-caused on dev-a05 (2026-07-10): adding largeLanguageModel here
-                # without metrics stopped customMetrics the moment it was applied.
-                # Setting both lets emit-token-metric (customMetrics/cached) AND the
-                # LlmLog table coexist on the same API.
                 "metrics": True,
-                "largeLanguageModel": {
-                    "logs": "enabled",
-                    "requests": {"messages": "all", "maxSizeInBytes": 32768},
-                    "responses": {"messages": "all", "maxSizeInBytes": 32768},
-                },
             }
         }
         try:
@@ -938,9 +1057,9 @@ class ApimProvisioner:
             with httpx.Client(timeout=30.0) as hc:
                 r = hc.put(url, headers=headers, json=body)
                 r.raise_for_status()
-            logger.info("LLM diagnostic enabled on API %s", api_id)
+            logger.info("API diagnostic pinned (metrics on, LLM logging off) on %s", api_id)
         except (httpx.HTTPError, HttpResponseError) as exc:
-            logger.warning("LLM diagnostic on API %s skipped: %s", api_id, exc)
+            logger.warning("API diagnostic on %s skipped: %s", api_id, exc)
 
     def _backend_base(self) -> str:
         return (
@@ -980,12 +1099,48 @@ class ApimProvisioner:
         """Remove a hub's backends from the 3 pools and delete them. Idempotent."""
         for provider in ("openai", "anthropic", "google"):
             be_id = f"llm-{provider}-{account_id}"
-            self._pool_remove_service(f"llm-{provider}-pool", be_id)
+            self._pool_remove_service(f"llm-{provider}-pool", be_id, provider=provider)
             self.remove_backend(be_id)
         # Delete any extra recorded backends not covered by the naming scheme.
         for be_id in backend_ids or []:
             if not be_id.endswith(account_id):
                 self.remove_backend(be_id)
+
+    def _detach_api_policy(self, provider: str) -> None:
+        """Delete the provider API's inbound policy so its pool can be deleted.
+
+        ARM refuses to delete a backend that a policy references:
+
+            ValidationError: Backend 'llm-openai-pool' is used by the following
+            entities: /apis/llm-openai;rev=1/policies/policy
+
+        and the policy ALWAYS references the pool — `<set-backend-service
+        backend-id="llm-<provider>-pool"/>` is how routing works. So removing
+        the last hub of a provider could never succeed: pool-delete was the only
+        legal move (ARM rejects an empty services[]) and it was blocked.
+
+        This is the missing half of the inverse. Account creation does:
+            add_hub_to_pools        -> creates the pool
+            ensure_pooled_provider_api -> creates the API + policy -> pool
+        Teardown undid only the first. Undoing the second in the opposite order
+        (policy, then pool) is what makes the two symmetric.
+
+        Only the POLICY is deleted, not the API: it is the minimum that lifts the
+        ARM constraint, so a later failure destroys as little as possible. The
+        next account re-puts it via `_ensure_api_and_ops`, which is why leaving
+        the API in place is safe — and why a policy naming a not-yet-existing
+        pool is fine, since that is already the order on a fresh environment
+        (pool at step 3, policy at step 4).
+        """
+        cfg = PROVIDER_APIS.get(provider)
+        if not cfg:
+            return
+        try:
+            self.client.api_policy.delete(
+                self._rg, self._service, cfg["api_id"], "policy", if_match="*"
+            )
+        except ResourceNotFoundError:
+            pass  # already gone — the desired end state either way
 
     def _pool_add_service(self, pool_id: str, backend_id: str) -> None:
         """GET pool -> append backend to services[] (preserving sessionAffinity)
@@ -1023,7 +1178,7 @@ class ApimProvisioner:
                 if etag:
                     put_headers["If-Match"] = etag
                 pr = hc.put(url, headers=put_headers, json={"properties": props})
-                pr.raise_for_status()
+                self._raise_for_arm(pr)
             elif r.status_code == 404:
                 # First account: create the pool with this one member + affinity.
                 props = {
@@ -1037,13 +1192,52 @@ class ApimProvisioner:
                     },
                 }
                 pr = hc.put(url, headers=headers, json={"properties": props})
-                pr.raise_for_status()
+                self._raise_for_arm(pr)
             else:
-                r.raise_for_status()
+                self._raise_for_arm(r)
 
-    def _pool_remove_service(self, pool_id: str, backend_id: str) -> None:
+    @staticmethod
+    def _raise_for_arm(resp: httpx.Response) -> None:
+        """raise_for_status(), but keep ARM's explanation.
+
+        httpx's own message is the status line and URL and nothing else. ARM
+        always sends a JSON body naming the offending field, and discarding it
+        turns a self-describing failure into a guessing game: the empty-pool
+        ValidationError below sat behind a bare "400 Bad Request" in the logs
+        and cost a live reproduction to recover a message the service had
+        already sent us.
+        """
+        if not resp.is_error:
+            return
+        raise httpx.HTTPStatusError(
+            f"{resp.request.method} {resp.request.url} -> {resp.status_code}: "
+            f"{resp.text[:1000]}",
+            request=resp.request,
+            response=resp,
+        )
+
+    def _pool_remove_service(
+        self, pool_id: str, backend_id: str, provider: str | None = None
+    ) -> None:
         """GET pool -> drop backend from services[] -> PUT. No-op if pool or
-        member is absent."""
+        member is absent.
+
+        Removing the LAST member DELETES the pool rather than writing an empty
+        services list, because ARM refuses the latter:
+
+            ValidationError: At least 1 service and at most 30 services should
+            be identified for the backend pool.
+
+        (Reproduced against the deployed APIM, not inferred from the docs.)
+        That 400 used to propagate out of account teardown, which carried on
+        regardless — terraform destroyed the hub and the account row was
+        deleted, leaving a backend wired into a pool that pointed at a Container
+        App which no longer existed, and no record left for a retry to work
+        from. One request in three then hit the dead hub.
+
+        Deleting the pool is the exact inverse of _pool_add_service, which
+        recreates it from a 404 when the next account arrives.
+        """
         # Match on the lowercased `/backends/<id>` suffix — same normalization as
         # _pool_add_service. ARM stores the service id as a RELATIVE path with
         # potentially different casing than we'd construct, so a case-sensitive
@@ -1056,7 +1250,7 @@ class ApimProvisioner:
             r = hc.get(url, headers=headers)
             if r.status_code == 404:
                 return
-            r.raise_for_status()
+            self._raise_for_arm(r)
             body = r.json()
             props = body.get("properties", {})
             pool = props.get("pool") or {}
@@ -1066,11 +1260,22 @@ class ApimProvisioner:
             ]
             if len(kept) == len(services):
                 return  # not a member — idempotent
+            etag = r.headers.get("ETag") or "*"
+            if not kept:
+                # The API policy references this pool, and ARM will not delete a
+                # referenced backend. Drop the policy first; the next account
+                # re-puts it. Without this the delete is a guaranteed 400 —
+                # which is exactly what dev-16 hit on its last hub.
+                if provider:
+                    self._detach_api_policy(provider)
+                dr = hc.delete(url, headers={**headers, "If-Match": etag})
+                # 404 = someone else got there first; still the desired end state.
+                if dr.status_code != 404:
+                    self._raise_for_arm(dr)
+                return
             pool["services"] = kept
             props["pool"] = pool
-            etag = r.headers.get("ETag")
-            put_headers = dict(headers)
-            if etag:
-                put_headers["If-Match"] = etag
-            pr = hc.put(url, headers=put_headers, json={"properties": props})
-            pr.raise_for_status()
+            pr = hc.put(
+                url, headers={**headers, "If-Match": etag}, json={"properties": props}
+            )
+            self._raise_for_arm(pr)

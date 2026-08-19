@@ -62,6 +62,21 @@ export const en = {
     emptyTitle: "No tenants yet",
     emptyHint: "A tenant is the billing & isolation boundary. Create your first.",
     editTitle: "Edit tenant",
+    audit: "Body archival",
+    auditOn: "on",
+    auditOff: "off",
+    auditEnable: "Turn on archival",
+    auditDisable: "Turn off archival",
+    auditOnTitle: "Archive raw bodies?",
+    auditOnImpact:
+      "Every subsequent call by {{name}} has its full request and response body archived, kept for 90 days.",
+    auditOnWarning:
+      "That content includes the customer's source code and whatever users paste into a prompt, secrets and personal data included. Confirm the customer has been told before turning this on.",
+    auditOffImpact:
+      "New calls by {{name}} stop being archived. Already-archived content is untouched and still expires on its original retention.",
+    auditOnDone: "Body archival is on.",
+    auditOffDone: "Body archival is off.",
+    auditFailed: "The gateway rejected the change — archival is unchanged.",
     deleteTitle: "Delete tenant?",
     deleteImpact: "Removes {{name}} and its projects.",
     hasKeys: "This tenant still has keys — delete those first.",
@@ -197,6 +212,16 @@ export const en = {
     resyncHint:
       "Re-read this hub's model catalog: add new models, drop retired ones (platform routes only).",
     resyncedOk: "Models resynced ({{count}} added).",
+    relogin: "Re-login",
+    reloginHint:
+      "Signing this GitHub account in elsewhere can invalidate the authorization held here, and every request through this hub then fails. Re-run the device flow and the new token is hot-swapped into the running hub: no redeploy, no restart, no dropped requests. Note: if the hub restarts before the next deploy it falls back to the deploy-time token.",
+    reloginTitle: "Re-login to GitHub",
+    reloginOk: "Token replaced",
+    reloginOkHint:
+      "The new token is live on the running hub and written to Key Vault for the next deploy.",
+    reloginFailed: "Re-login failed.",
+    reloginUnchanged:
+      "Nothing was changed — the hub still has its previous token. Safe to retry.",
     status: {
       pending: "Awaiting authorization",
       deploying: "Deploying",
@@ -217,22 +242,38 @@ export const en = {
     completionTokens: "Completion tokens",
     cost: "Cost (USD)",
     billed: "Billed (USD)",
-    cosmosSection: "Usage & cost — from Cosmos",
     telemetrySection: "Calls & latency — from App Insights",
-    callLog: "Call log",
+    // Says where the rows come from, matching the App Insights label above.
+    // The two blocks are deliberately different sources, not two opinions:
+    // Cosmos only ever sees calls that reached a hub, so a breaker-shed 503
+    // appears in the telemetry block and nowhere here.
+    callLog: "Call log — from Cosmos (billing source)",
     colTime: "Time",
     colModel: "Model",
     colKey: "Project / Key",
+    colStatus: "Status",
     colPromptTok: "Prompt tok",
     colCompletionTok: "Completion tok",
     colCachedTok: "Cached tok",
+    colCacheWriteTok: "Cache write",
+    colCostUsd: "Cost (USD)",
+    // Upstream priced nothing for this call, so 0 would be a guess dressed as a
+    // fact. Shown as a dash with the reason instead.
+    unpriced: "unpriced",
+    unpricedHint:
+      "Upstream returned no price for this call (non-Copilot backend, or an "
+      + "unrecognised response shape). Recorded as unpriced rather than $0.00 — "
+      + "the importer does not guess from a local price table.",
+    estimated: "est.",
+    estimatedHint:
+      "The hub estimated these token counts because upstream returned none. "
+      + "Do not use this row to settle a billing dispute.",
     noRecords: "No call records yet for this tenant.",
     showAll: "Show all {{n}}",
     pagePrev: "Previous",
     pageNext: "Next",
     pageIndicator: "Page {{page}} of {{pages}}",
     pageSize: "Per page",
-    totalCalls: "Total calls",
     colApi: "API",
     colCalls: "Calls",
     colP50: "p50",
@@ -240,16 +281,17 @@ export const en = {
     colGateway: "Gateway p50",
     colBackend: "Backend p50",
     colFailures: "Failures",
-    trendSection: "Calls per hour",
+    trendSection: "Calls over time",
     noTelemetry: "No telemetry (App Insights not configured or no calls yet).",
-    breakdownSection: "Token breakdown — from App Insights",
+    breakdownSection: "Tokens & cost — billing source",
     breakdownHint:
-      "Token metering from APIM (covers streaming + non-streaming). Group by model, endpoint, or key; split by token type.",
+      "Priced per call from the upstream provider's own usage report, covering streaming and non-streaming alike — these are the numbers the invoice is built from. Group by model, endpoint, key, hub, or end user. Arrives via a capture pipeline, so the most recent few minutes may not be here yet.",
     colEndpoint: "Endpoint",
     groupBy_model: "Model",
     groupBy_api: "Endpoint",
     groupBy_subscription: "Key (token)",
     groupBy_backend: "Hub (backend)",
+    groupBy_end_user: "End user",
     modelUnknown: "(unlabeled)",
     tokTotal: "Total",
     tokPrompt: "Prompt",
@@ -257,11 +299,36 @@ export const en = {
     tokCompletion: "Completion",
     tokReasoning: "Reasoning",
     tokCacheCreation: "Cache write",
+    tokCacheWrite: "Cache write",
+    colCost: "Cost (USD)",
+    colBilled: "Billed (USD)",
     callsLabel: "Calls",
+    okCallsLabel: "Succeeded",
+    failedCallsLabel: "Failed",
+    failedHint:
+      "Failures here are calls that reached a hub and were rejected upstream — " +
+      "they cost nothing but did not serve the customer. Requests the gateway " +
+      "shed itself (circuit-breaker 503, unmatched 404) never reach a hub and " +
+      "so appear only in the App Insights block below.",
+    telemetryReconcileHint:
+      "Gateway-side counts, covering every request that hit APIM. Expect more " +
+      "failures than the billing block above: 429 should match code-for-code, " +
+      "while 503/404 exist only here because those requests never reached a hub.",
     tokTrendSection: "Tokens & calls over time",
     tokTrendSeries: "Tokens",
     callTrendSeries: "Calls",
-    noBreakdown: "No token metrics yet for this tenant (or App Insights not configured).",
+    noBreakdown: "No usage recorded for this tenant in this window yet.",
+    // Time-window picker. One window governs the whole page — the call log used
+    // to be unfiltered while the breakdown below it was pinned to 24h, so a page
+    // could show 96 records and "nothing in this window" at the same time.
+    window: "Window",
+    window_1: "Last 1 hour",
+    window_6: "Last 6 hours",
+    window_24: "Last 24 hours",
+    window_72: "Last 3 days",
+    window_168: "Last 7 days",
+    window_720: "Last 30 days",
+    windowHint: "Try widening the window above.",
   },
   users: {
     title: "Users",

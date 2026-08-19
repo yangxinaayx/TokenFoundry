@@ -21,6 +21,10 @@ variable "log_analytics_workspace_id" { type = string }
 variable "log_analytics_customer_id" { type = string }
 
 variable "image_tag" { type = string }
+# Separate from image_tag: deploy.sh builds both images with the same tag, but
+# update-app.sh rebuilds only the app, so after any app-only update the newest
+# tokenfoundry tag names a gitmodel image that was never built.
+variable "hub_image_tag" { type = string }
 variable "key_vault_uri" { type = string }
 variable "vault_id" { type = string }
 variable "cosmos_endpoint" { type = string }
@@ -68,6 +72,64 @@ variable "github_ref" {
   type        = string
   default     = "master"
   description = "Git ref the workflow_dispatch targets (injected as TF_GITHUB_REF)."
+}
+
+# --- Usage pipeline: Event Hub (hubs produce) + Capture blobs (we import) ---
+# The control plane never touches the Event Hub itself — it only reads the Avro
+# blobs Capture writes. The first three values are pure pass-through: the app
+# republishes them as GitHub Actions variables so the hub deploy can point each
+# hub's producer at the right namespace (same pattern as HUB_ACR_NAME above).
+variable "eventhub_namespace_id" {
+  type        = string
+  description = "Namespace id — republished so the hub terraform can scope its Event Hubs Data Sender grant."
+}
+variable "eventhub_fqdn" {
+  type        = string
+  description = "Namespace host each hub's producer connects to (becomes the hub's TF_EVENTHUB_FQDN)."
+}
+variable "eventhub_name" {
+  type        = string
+  description = "Event hub usage events are sent to (becomes the hub's TF_EVENTHUB_NAME)."
+}
+variable "usage_capture_storage_account" {
+  type        = string
+  description = "Storage account Capture writes Avro blobs to — the import job's source."
+}
+variable "usage_capture_storage_account_id" {
+  type        = string
+  description = "Capture storage id — scope for the control plane's Storage Blob Data Reader grant."
+}
+variable "usage_capture_container" {
+  type        = string
+  description = "Blob container holding Capture output."
+}
+variable "usage_capture_interval_seconds" {
+  type        = string
+  description = "Capture's flush interval. The import job schedules itself no tighter than this, since running faster only re-lists the same blobs."
+}
+
+# --- Audit archive: pure pass-through, no role granted here ---
+# All four values are republished as GitHub Actions variables for the hub deploy
+# (same pattern as the eventhub trio above). The control plane deliberately gets
+# NO role on the audit account: it records blob paths next to usage documents so
+# an operator knows where a payload is, but reading one requires a role granted
+# out of band to a named human. Auditing must not become a thing the portal can
+# do to any tenant by accident.
+variable "audit_account_url" {
+  type        = string
+  description = "Blob endpoint hubs write audit payloads to (becomes the hub's TF_AUDIT_ACCOUNT_URL)."
+}
+variable "audit_container" {
+  type        = string
+  description = "Container audit payloads land in (becomes the hub's TF_AUDIT_CONTAINER)."
+}
+variable "audit_container_scope" {
+  type        = string
+  description = "Container resource id — republished so the hub terraform can scope its Storage Blob Data Contributor grant to the container instead of the whole account."
+}
+variable "audit_retention_days" {
+  type        = string
+  description = "Retention the infra actually enforces, surfaced so the app can state the real window rather than a hard-coded one that drifts."
 }
 
 resource "azurerm_container_app_environment" "env" {
@@ -269,11 +331,62 @@ resource "azurerm_container_app" "app" {
       }
       env {
         # Image TAG the hub deploy references. deploy.sh builds gitmodel:<tag>
-        # with this SAME tag (never "latest"), so the Portal's deploy-config
-        # flow must publish gitmodel:<this-tag> as HUB_IMAGE_REF — not a
-        # hard-coded :latest that doesn't exist in ACR.
+        # (never "latest" — this repo pushes no such tag), so the Portal's
+        # deploy-config flow publishes gitmodel:<this-tag> as HUB_IMAGE_REF.
+        # Deliberately NOT var.image_tag: update-app.sh advances the app tag
+        # without building a hub image, so reusing it here would point hub
+        # deploys at an image that does not exist.
         name  = "TF_HUB_IMAGE_TAG"
-        value = var.image_tag
+        value = var.hub_image_tag
+      }
+
+      # --- Usage pipeline ---
+      # The first three are only republished as Actions variables for the hub
+      # deploy (the control plane itself never produces to the hub); the
+      # capture_* ones are what the import job actually reads.
+      env {
+        name  = "TF_EVENTHUB_NAMESPACE_ID"
+        value = var.eventhub_namespace_id
+      }
+      env {
+        name  = "TF_EVENTHUB_FQDN"
+        value = var.eventhub_fqdn
+      }
+      env {
+        name  = "TF_EVENTHUB_NAME"
+        value = var.eventhub_name
+      }
+      env {
+        name  = "TF_USAGE_CAPTURE_STORAGE_ACCOUNT"
+        value = var.usage_capture_storage_account
+      }
+      env {
+        name  = "TF_USAGE_CAPTURE_CONTAINER"
+        value = var.usage_capture_container
+      }
+      env {
+        name  = "TF_USAGE_CAPTURE_INTERVAL_SECONDS"
+        value = var.usage_capture_interval_seconds
+      }
+
+      # --- Audit archive ---
+      # Republished for the hub deploy only. The app never reads these blobs;
+      # it has no role on the account and is not meant to acquire one.
+      env {
+        name  = "TF_AUDIT_ACCOUNT_URL"
+        value = var.audit_account_url
+      }
+      env {
+        name  = "TF_AUDIT_CONTAINER"
+        value = var.audit_container
+      }
+      env {
+        name  = "TF_AUDIT_CONTAINER_SCOPE"
+        value = var.audit_container_scope
+      }
+      env {
+        name  = "TF_AUDIT_RETENTION_DAYS"
+        value = var.audit_retention_days
       }
 
       liveness_probe {
@@ -292,6 +405,21 @@ resource "azurerm_container_app" "app" {
     azurerm_role_assignment.acr_pull,
     azurerm_role_assignment.kv_secrets_user,
   ]
+
+  lifecycle {
+    # The APP IMAGE is owned by the deploy scripts, not by terraform.
+    # update-app.sh rolls a new revision with `az containerapp update --image`,
+    # which terraform sees as drift and "corrects" on the next apply — quietly
+    # reverting the running app to whatever tag that apply was given. Observed:
+    # a plan taken to delete one role assignment also proposed rewriting the
+    # live image from v20260806142705 back to a tag that does not exist.
+    #
+    # var.image_tag still applies at CREATE (a new environment needs a first
+    # image); after that the scripts are authoritative. TF_HUB_IMAGE_TAG is NOT
+    # ignored — nothing changes it out of band, so terraform stays its source of
+    # truth.
+    ignore_changes = [template[0].container[0].image]
+  }
 }
 
 # --- Post-app role assignments on the app's SYSTEM identity ---
@@ -361,6 +489,20 @@ resource "azurerm_cosmosdb_sql_role_assignment" "app_data_contributor" {
 # smaller than P2's subscription-Contributor deployer identity, which is gone.
 resource "azurerm_role_assignment" "app_tfstate_reader" {
   scope                = var.tfstate_storage_account_id
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = azurerm_container_app.app.identity[0].principal_id
+  principal_type       = "ServicePrincipal"
+}
+
+# --- Usage import: read Capture's Avro blobs ---
+#
+# The control plane's import job lists and downloads the blobs Event Hub Capture
+# wrote, turns each record into a Cosmos document, and advances a watermark. It
+# never writes to this account (Capture owns the container), so READER is the
+# whole privilege. Note it does NOT get any Event Hub role: the control plane is
+# not a consumer, it reads the drained blobs — that is the point of Capture.
+resource "azurerm_role_assignment" "app_usage_capture_reader" {
+  scope                = var.usage_capture_storage_account_id
   role_definition_name = "Storage Blob Data Reader"
   principal_id         = azurerm_container_app.app.identity[0].principal_id
   principal_type       = "ServicePrincipal"
