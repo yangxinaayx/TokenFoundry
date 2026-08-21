@@ -57,7 +57,14 @@ export interface VirtualKeySecret extends VirtualKey {
 export interface ModelRoute {
   id: string;
   name: string;
+  // The PROTOCOL the model is served over — decides the APIM API, the auth
+  // header and the available paths. Not the company: Grok and Kimi are
+  // "openai" here because that is the schema they speak.
   provider: "openai" | "anthropic" | "google" | "azure";
+  // The company that made it ("xAI", "Moonshot", "Anthropic"). Display and
+  // grouping only. null when the model name matches no known vendor — shown as
+  // a dash, never guessed.
+  vendor: string | null;
   owner_scope: "PLATFORM" | "TENANT";
   deployment_name: string | null;
   api_version: string | null;
@@ -219,6 +226,12 @@ export interface TokenGroup {
   subscription?: string;
   backend?: string;
   end_user?: string;
+  // Human-readable name for the group id, when one exists. Currently the
+  // GitHub login behind a hub: `backend` stays the durable id (a login can
+  // be renamed, the id cannot), and this rides along so the table can say
+  // WHICH account is spending. Absent when nothing resolves — e.g. an
+  // account deleted after its calls were billed.
+  label?: string;
   prompt_tok: number;
   cached_tok: number;
   // Priced HIGHER than input upstream, so it is shown rather than folded into
@@ -258,6 +271,39 @@ export interface UsageBreakdown {
   totals: UsageTotals;
 }
 
+/**
+ * A non-2xx response, carrying the status so callers can branch on it.
+ *
+ * Previously every failure was a bare `Error("401: ...")`, which meant an
+ * expired session was indistinguishable from a real error at the call site —
+ * and nothing acted on it. The UI kept rendering, every panel came back empty,
+ * and it read as "the system is broken" rather than "sign in again".
+ */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly detail: string,
+  ) {
+    super(`${status}: ${detail}`);
+    this.name = "ApiError";
+  }
+}
+
+/** Fired when the backend rejects our token. AuthProvider listens and logs out.
+ *
+ * An event rather than a direct call so this module stays free of any auth
+ * import — the dependency runs one way (auth -> client), and every call site
+ * gets the behaviour without having to remember it.
+ */
+export const UNAUTHORIZED_EVENT = "tf:unauthorized";
+
+function raise(status: number, detail: string): never {
+  if (status === 401) {
+    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+  }
+  throw new ApiError(status, detail);
+}
+
 async function request<T>(
   path: string,
   token: string,
@@ -271,10 +317,7 @@ async function request<T>(
       ...(init?.headers ?? {}),
     },
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`${res.status}: ${detail}`);
-  }
+  if (!res.ok) raise(res.status, await res.text());
   return res.json() as Promise<T>;
 }
 
@@ -291,10 +334,7 @@ async function requestNoContent(
       ...(init?.headers ?? {}),
     },
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`${res.status}: ${detail}`);
-  }
+  if (!res.ok) raise(res.status, await res.text());
 }
 
 export const api = {

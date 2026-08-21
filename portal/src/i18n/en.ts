@@ -21,6 +21,8 @@ export const en = {
     signIn: "Sign in",
     signingIn: "Signing in…",
     failed: "login failed",
+    sessionExpired:
+      "Your session expired, so you were signed out. Sign in again to continue.",
   },
   common: {
     loading: "Loading…",
@@ -66,6 +68,14 @@ export const en = {
     auditOn: "on",
     auditOff: "off",
     auditEnable: "Turn on archival",
+    // Shown in place of "Turn on" while the feature is withheld. Says
+    // "not available" rather than "coming soon" — the pipeline exists,
+    // it just has not been proven end to end yet.
+    auditUnavailable: "Archival unavailable",
+    auditUnavailableHint:
+      "Raw-body archival is not offered yet. The pipeline is built but has "
+      + "not been verified end to end, and its failure mode is silent — so it "
+      + "stays switched off until it has been exercised on a live environment.",
     auditDisable: "Turn off archival",
     auditOnTitle: "Archive raw bodies?",
     auditOnImpact:
@@ -160,6 +170,11 @@ export const en = {
     priceOutCol: "$ out/1k",
     searchPlaceholder: "Search alias…",
     allProviders: "All providers",
+    allVendors: "All vendors",
+    // The company that made the model. Distinct from `provider`, which is
+    // the protocol it is served over — Grok and Kimi are both "openai"
+    // there while being xAI and Moonshot here.
+    vendor: "Vendor",
     noMatch: "No models match.",
     emptyTitle: "No models yet",
     emptyHint: "Add Claude, Kimi, GPT or Gemini as a client-facing alias.",
